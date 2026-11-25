@@ -1,9 +1,10 @@
 import { useRpc, useTranslation, type PluginTranslations } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
+  UNATTRIBUTED_ACCOUNT_ID,
   usageStatsRpc,
   type AccountSummary,
   type StatsRange,
@@ -246,6 +247,7 @@ function StatTile({
   unit,
   foot,
   width,
+  compact = false,
   selected,
   onPress,
   children,
@@ -256,11 +258,13 @@ function StatTile({
   unit?: string;
   foot: string;
   width: number | "100%";
+  compact?: boolean;
   selected: boolean;
   onPress(): void;
   children: ReactNode;
 }) {
   const edge = selected ? 2 : 1;
+  const pad = (compact ? space.md : space.lg) - edge + 1;
   return (
     <Pressable
       accessibilityRole="tab"
@@ -269,7 +273,7 @@ function StatTile({
       onPress={onPress}
       style={(state) => ({
         width,
-        padding: space.lg - edge + 1,
+        padding: pad,
         gap: space.xs,
         borderRadius: radius.lg,
         borderWidth: edge,
@@ -286,7 +290,16 @@ function StatTile({
       </Text>
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.xs }}>
         {/* Proportional figures: tabular digits look loose at display sizes. */}
-        <Text numberOfLines={1} style={{ fontSize: 26, lineHeight: 32, fontWeight: "600", color: colors.foreground }}>
+        <Text
+          numberOfLines={1}
+          style={{
+            fontSize: compact ? 22 : 26,
+            lineHeight: compact ? 28 : 32,
+            fontWeight: "600",
+            color: colors.foreground,
+            flexShrink: 1,
+          }}
+        >
           {value}
         </Text>
         {unit ? <Text style={{ ...font.small, color: colors.foregroundMuted }}>{unit}</Text> : null}
@@ -314,12 +327,15 @@ function tickLabel(start: number, binMs: number, locale: string): string {
   return clockTime(start, locale);
 }
 
-function showsTick(start: number, binMs: number, index: number, total: number): boolean {
-  if (index === 0 || index === total - 1) return false;
+function showsTick(start: number, binMs: number, index: number, total: number, narrow: boolean): boolean {
+  if (index <= 1 || index >= total - 2) return false;
   const date = new Date(start);
-  if (binMs >= 86_400_000) return index % 5 === 0;
-  if (binMs >= 6 * 3_600_000) return date.getHours() === 0;
-  return date.getHours() % 6 === 0;
+  if (binMs >= 86_400_000) return index % (narrow ? 8 : 5) === 0;
+  if (binMs >= 6 * 3_600_000) {
+    if (date.getHours() !== 0) return false;
+    return !narrow || Math.floor(index / 4) % 2 === 1;
+  }
+  return date.getHours() % (narrow ? 8 : 6) === 0;
 }
 
 /** "Nov 23 00:00 – now" for hourly ranges, "Oct 25 – Nov 23" for days: the window the range covers. */
@@ -350,9 +366,11 @@ function MetricChart({
   const [hovered, setHovered] = useState<number | null>(null);
   const [pointer, setPointer] = useState<number | null>(null);
   const [plotWidth, setPlotWidth] = useState(0);
+  const hoverPointer = useRef(false);
   const bins = stats.bins;
 
   useEffect(() => {
+    hoverPointer.current = false;
     setHovered(null);
     setPointer(null);
   }, [stats.range, bins.length]);
@@ -396,14 +414,25 @@ function MetricChart({
           : centered;
 
   return (
-    <Card colors={colors} style={{ padding: space.lg, gap: space.md }}>
-      <View
-        style={{
-          flexDirection: compact ? "column" : "row",
-          alignItems: compact ? "flex-start" : "baseline",
-          gap: compact ? 2 : space.md,
+    <Card colors={colors} style={{ padding: space.lg }}>
+      <Pressable
+        accessible={false}
+        focusable={false}
+        onPress={() => {
+          if (!hoverPointer.current) {
+            setHovered(null);
+            setPointer(null);
+          }
         }}
+        style={{ gap: space.md }}
       >
+        <View
+          style={{
+            flexDirection: compact ? "column" : "row",
+            alignItems: compact ? "flex-start" : "baseline",
+            gap: compact ? 2 : space.md,
+          }}
+        >
         <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flex: compact ? undefined : 1, minWidth: 0 }}>
           <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
             {t(METRIC_LABEL[metric])}
@@ -459,14 +488,25 @@ function MetricChart({
                       entry.requests === 0 ? t("stats.noRequests") : metricText(entry, metric, locale, t)
                     }`}
                     onHoverIn={() => {
+                      hoverPointer.current = true;
                       setHovered(index);
                       setPointer(index);
                     }}
                     onHoverOut={() => {
+                      hoverPointer.current = false;
                       setHovered((current) => (current === index ? null : current));
                       setPointer((current) => (current === index ? null : current));
                     }}
-                    onPressIn={() => setHovered(index)}
+                    onPress={(event) => {
+                      event.stopPropagation?.();
+                      if (hoverPointer.current) {
+                        setHovered(index);
+                        setPointer(index);
+                        return;
+                      }
+                      setHovered((current) => (current === index ? null : index));
+                      setPointer((current) => (current === index ? null : index));
+                    }}
                     style={(state) => ({
                       flex: 1,
                       height: "100%",
@@ -496,9 +536,9 @@ function MetricChart({
           <View style={{ flexDirection: "row", marginTop: space.xs, height: 16 }}>
             {bins.map((entry, index) => (
               <View key={entry.start} style={{ flex: 1, alignItems: "center" }}>
-                {showsTick(entry.start, stats.binMs, index, bins.length) ? (
-                  <View pointerEvents="none" style={{ position: "absolute", width: 72, alignItems: "center" }}>
-                    <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                {showsTick(entry.start, stats.binMs, index, bins.length, compact || (plotWidth > 0 && plotWidth < 420)) ? (
+                  <View pointerEvents="none" style={{ position: "absolute", width: 76, alignItems: "center" }}>
+                    <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
                       {tickLabel(entry.start, stats.binMs, locale)}
                     </Text>
                   </View>
@@ -511,6 +551,7 @@ function MetricChart({
                 pointerEvents="none"
                 style={{
                   position: "absolute",
+                  zIndex: 10,
                   top: 0,
                   left: tooltipLeft,
                   width: tooltipWidth,
@@ -560,6 +601,7 @@ function MetricChart({
             ) : null}
         </View>
       </View>
+      </Pressable>
     </Card>
   );
 }
@@ -710,8 +752,8 @@ function ModelTable({
 
   return (
     <Card colors={colors} style={{ padding: space.lg, gap: space.sm }}>
-      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, marginBottom: space.xs }}>
-        <Text style={{ ...font.heading, color: colors.foreground, flex: 1 }}>{t("stats.models")}</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: space.sm, rowGap: 2, marginBottom: space.xs }}>
+        <Text style={{ ...font.heading, color: colors.foreground, flexGrow: 1 }}>{t("stats.models")}</Text>
         <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("stats.modelsHint")}</Text>
       </View>
 
@@ -818,7 +860,12 @@ function ModelTable({
                     <Muted colors={colors} small>
                       {t("stats.readoutRequests", { count: figures.requests, value: integer(figures.requests, locale) })}
                     </Muted>
-                    {costCell(model.pricingKey, model.label, cells.cost, figures.cost === null)}
+                    {costCell(
+                      model.pricingKey,
+                      model.label,
+                      figures.cost === null ? t("pricing.unpriced") : cells.cost,
+                      figures.cost === null,
+                    )}
                     <Muted colors={colors} small>
                       {[
                         `${t("stats.col.context")} ${cells.context}`,
@@ -885,7 +932,303 @@ function ModelTable({
                     </Text>
                   </View>
                   <Muted colors={colors} small>
-                    {[t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`].join(" · ")}
+                    {(totals.requests === 0
+                      ? [t("stats.readoutRequests", { count: 0, value: integer(0, locale) })]
+                      : [t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`]
+                    ).join(" · ")}
+                  </Muted>
+                </>
+              );
+            })()}
+          </View>
+        ) : null}
+      </View>
+    </Card>
+  );
+}
+
+interface AccountBreakdownRow extends UsageTotals {
+  accountId: string;
+  label: string;
+  conversations: number;
+}
+
+const ZERO_TOTALS: UsageTotals = {
+  requests: 0,
+  input: 0,
+  cached: 0,
+  output: 0,
+  generationSeconds: 0,
+  firstTokenSeconds: 0,
+  cost: 0,
+  pricedRequests: 0,
+};
+
+function AccountTable({
+  colors,
+  rowsData,
+  locale,
+  wide,
+  selectedAccountId,
+  onSelectAccount,
+}: {
+  colors: Colors;
+  rowsData: readonly AccountBreakdownRow[];
+  locale: string;
+  wide: boolean;
+  selectedAccountId: string | null;
+  onSelectAccount(accountId: string | null): void;
+}) {
+  const { t } = useTranslation(messages);
+  const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: "tokens", descending: true });
+  const shareKey: ShareKey = sort.key === "requests" || sort.key === "cost" ? sort.key : "tokens";
+  const rows = useMemo(() => {
+    const list = rowsData.map((account) => ({ account, figures: derive(account) }));
+    list.sort((left, right) => {
+      const a = sortValue(left.figures, sort.key);
+      const b = sortValue(right.figures, sort.key);
+      if (a === null || b === null) return a === null ? (b === null ? 0 : 1) : -1;
+      if (b !== a) return sort.descending ? b - a : a - b;
+      if (left.account.accountId === UNATTRIBUTED_ACCOUNT_ID) return 1;
+      if (right.account.accountId === UNATTRIBUTED_ACCOUNT_ID) return -1;
+      return left.account.label.localeCompare(right.account.label);
+    });
+    return list;
+  }, [rowsData, sort]);
+  const totals = useMemo(() => derive(sumTotals(rowsData)), [rowsData]);
+  const shareTotal = rows.reduce((sum, row) => sum + shareValue(row.figures, shareKey), 0);
+
+  const columns: ReadonlyArray<{ key: SortKey; label: string; width: number }> = [
+    { key: "requests", label: t("stats.col.requests"), width: 70 },
+    { key: "tokens", label: t("stats.col.tokens"), width: 66 },
+    { key: "cost", label: t("stats.col.cost"), width: 78 },
+    { key: "context", label: t("stats.col.context"), width: 86 },
+    { key: "output", label: t("stats.col.output"), width: 80 },
+    { key: "speed", label: t("stats.col.speed"), width: 78 },
+    { key: "cache", label: t("stats.col.cache"), width: 66 },
+    { key: "firstToken", label: t("stats.col.firstToken"), width: 78 },
+  ];
+
+  const cellsOf = (figures: ReturnType<typeof derive>): Record<SortKey, string> => ({
+    requests: integer(figures.requests, locale),
+    tokens: tokens(figures.totalTokens),
+    cost: figures.cost === null ? "—" : usdFixed(figures.cost, locale),
+    context: figures.context === null ? "—" : tokens(Math.round(figures.context)),
+    output: figures.output === null ? "—" : tokens(Math.round(figures.output)),
+    speed: figures.tps === null ? "—" : t("stats.tps", { value: tpsLabel(figures.tps) }),
+    cache: figures.cacheRate === null ? "—" : percent(figures.cacheRate, locale),
+    firstToken: secondsFixed(figures.firstToken),
+  });
+
+  const toggleSort = (key: SortKey) =>
+    setSort((current) => (current.key === key ? { key, descending: !current.descending } : { key, descending: true }));
+
+  const rowFrame = {
+    paddingHorizontal: space.sm,
+    marginHorizontal: -space.sm,
+    borderRadius: radius.md,
+  } as const;
+
+  const nameCell = (label: string, share: number | null) => (
+    <View style={{ flex: 1, minWidth: 0, alignSelf: "stretch", justifyContent: "center", marginRight: space.lg }}>
+      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+        <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
+          {label}
+        </Text>
+        <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+          {share === null ? "—" : share > 0 && share < 0.001 ? `<${percent(0.001, locale)}` : percent(share, locale)}
+        </Text>
+      </View>
+      {share !== null && share >= 0.01 ? (
+        <View style={{ position: "absolute", left: 0, right: 0, bottom: 6, height: 3 }}>
+          <View
+            style={{
+              width: `${Math.min(1, share) * 100}%`,
+              height: 3,
+              borderRadius: 1.5,
+              backgroundColor: colors.accent,
+            }}
+          />
+        </View>
+      ) : null}
+    </View>
+  );
+
+  return (
+    <Card colors={colors} style={{ padding: space.lg, gap: space.sm }}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: space.sm, rowGap: 2, marginBottom: space.xs }}>
+        <Text style={{ ...font.heading, color: colors.foreground, flexGrow: 1 }}>{t("stats.accountsTable")}</Text>
+        <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("stats.accountsHint")}</Text>
+      </View>
+
+      {wide ? (
+        <View
+          style={{
+            ...rowFrame,
+            flexDirection: "row",
+            alignItems: "flex-end",
+            paddingBottom: space.sm,
+            borderBottomWidth: 1,
+            borderBottomColor: colors.border,
+            borderRadius: 0,
+          }}
+        >
+          <Text style={{ ...font.caption, color: colors.foregroundMuted, flex: 1 }}>{t("stats.colAccount")}</Text>
+          {columns.map((column) => {
+            const active = sort.key === column.key;
+            return (
+              <Pressable
+                key={column.key}
+                accessibilityRole="button"
+                accessibilityLabel={t("stats.sortBy", { column: column.label })}
+                accessibilityState={{ selected: active }}
+                onPress={() => toggleSort(column.key)}
+                style={(state) => ({
+                  width: column.width,
+                  flexDirection: "row",
+                  justifyContent: "flex-end",
+                  alignItems: "center",
+                  gap: 2,
+                  opacity: (state as PressState).hovered && !active ? 0.75 : 1,
+                })}
+              >
+                {active ? <Icon name={sort.descending ? "ArrowDown" : "ArrowUp"} size={11} color={colors.foreground} /> : null}
+                <Text
+                  numberOfLines={1}
+                  style={{ ...font.caption, color: active ? colors.foreground : colors.foregroundMuted, fontWeight: active ? "600" : "400" }}
+                >
+                  {column.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : null}
+
+      <View>
+        {rows.map(({ account, figures }, index) => {
+          const share =
+            shareKey === "cost" && figures.cost === null ? null : shareTotal > 0 ? shareValue(figures, shareKey) / shareTotal : 0;
+          const active = selectedAccountId === account.accountId;
+          const dimmed = selectedAccountId !== null && !active;
+          const cells = cellsOf(figures);
+          return (
+            <Pressable
+              key={account.accountId}
+              accessibilityRole="button"
+              accessibilityState={{ selected: active }}
+              onPress={() => onSelectAccount(active ? null : account.accountId)}
+              style={(state) => ({
+                ...rowFrame,
+                minHeight: wide ? 44 : undefined,
+                paddingVertical: wide ? 0 : space.sm,
+                flexDirection: wide ? "row" : "column",
+                alignItems: wide ? "center" : "stretch",
+                gap: wide ? 0 : space.xs,
+                borderTopWidth: index === 0 ? 0 : 1,
+                borderTopColor: tint(colors.foreground, 0.06),
+                opacity: dimmed ? 0.5 : 1,
+                backgroundColor: active
+                  ? tint(colors.accent, 0.08)
+                  : (state as PressState).hovered
+                    ? tint(colors.foreground, 0.04)
+                    : "transparent",
+              })}
+            >
+              {wide ? (
+                <>
+                  {nameCell(account.label, share)}
+                  {columns.map((column) => (
+                    <Text
+                      key={column.key}
+                      numberOfLines={1}
+                      style={{ ...font.small, ...tabular, color: colors.foreground, width: column.width, textAlign: "right" }}
+                    >
+                      {cells[column.key]}
+                    </Text>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <View style={{ flexDirection: "row", alignItems: "center", minHeight: 42 }}>
+                    {nameCell(account.label, share)}
+                    <Text style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}>
+                      {t("stats.readoutTokens", { value: cells.tokens })}
+                    </Text>
+                  </View>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: space.sm }}>
+                    <Muted colors={colors} small>
+                      {(figures.requests === 0
+                        ? [t("stats.readoutRequests", { count: 0, value: integer(0, locale) })]
+                        : [
+                            t("stats.readoutRequests", { count: figures.requests, value: integer(figures.requests, locale) }),
+                            cells.cost,
+                            cells.speed,
+                            `${t("stats.col.cache")} ${cells.cache}`,
+                          ]
+                      ).join(" · ")}
+                    </Muted>
+                  </View>
+                </>
+              )}
+            </Pressable>
+          );
+        })}
+
+        {rows.length > 1 ? (
+          <View
+            style={{
+              ...rowFrame,
+              flexDirection: wide ? "row" : "column",
+              alignItems: wide ? "center" : "stretch",
+              minHeight: wide ? 44 : undefined,
+              paddingVertical: wide ? 0 : space.sm,
+              gap: wide ? 0 : space.xs,
+              borderTopWidth: 1,
+              borderTopColor: colors.border,
+              borderRadius: 0,
+            }}
+          >
+            {(() => {
+              const cells = cellsOf(totals);
+              const label = (
+                <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground, flex: 1 }}>
+                  {t("stats.col.total")}
+                </Text>
+              );
+              return wide ? (
+                <>
+                  {label}
+                  {columns.map((column) => (
+                    <Text
+                      key={column.key}
+                      numberOfLines={1}
+                      style={{
+                        ...font.small,
+                        ...tabular,
+                        fontWeight: "600",
+                        color: column.key === "cost" && totals.cost === null ? colors.statusWarning : colors.foreground,
+                        width: column.width,
+                        textAlign: "right",
+                      }}
+                    >
+                      {cells[column.key]}
+                    </Text>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <View style={{ flexDirection: "row", alignItems: "center" }}>
+                    {label}
+                    <Text style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}>
+                      {t("stats.readoutTokens", { value: cells.tokens })}
+                    </Text>
+                  </View>
+                  <Muted colors={colors} small>
+                    {(totals.requests === 0
+                      ? [t("stats.readoutRequests", { count: 0, value: integer(0, locale) })]
+                      : [t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`]
+                    ).join(" · ")}
                   </Muted>
                 </>
               );
@@ -938,12 +1281,39 @@ export function UsageSection({
   const totals = stats ? derive(stats.totals) : null;
   const series = (pick: (bin: UsageTotals) => number | null) => (stats ? stats.bins.map((bin) => pick(bin)) : []);
   const hasSubagents = (stats?.breakdown.subagent.requests ?? 0) > 0;
-  const accountChips = stats?.accounts ?? [];
   const accountKindById = useMemo(() => new Map(accounts.map((a) => [a.id, a.kind])), [accounts]);
+  const accountEntries = useMemo<AccountBreakdownRow[]>(() => {
+    const byId = new Map((stats?.accounts ?? []).map((entry) => [entry.accountId, entry]));
+    const rows: AccountBreakdownRow[] = [];
+    const seen = new Set<string>();
+    for (const account of accounts) {
+      seen.add(account.id);
+      const found = byId.get(account.id);
+      rows.push({
+        ...(found ?? { ...ZERO_TOTALS, conversations: 0 }),
+        accountId: account.id,
+        label: displayLabel(account.label, t, account.kind),
+      });
+    }
+    for (const entry of stats?.accounts ?? []) {
+      if (seen.has(entry.accountId)) continue;
+      seen.add(entry.accountId);
+      rows.push({
+        ...entry,
+        label:
+          entry.accountId === UNATTRIBUTED_ACCOUNT_ID
+            ? t("stats.accountUnattributed")
+            : displayLabel(entry.label, t, accountKindById.get(entry.accountId)),
+      });
+    }
+    return rows;
+  }, [accounts, stats?.accounts, accountKindById, t]);
+  const showAccountControls = accounts.length > 1 || accountEntries.length > 1;
   const unpriced = stats ? stats.totals.requests - stats.totals.pricedRequests : 0;
   const tile = (key: ChartMetric) => ({
     colors,
     width: tileWidth,
+    compact,
     label: t(METRIC_LABEL[key]),
     selected: metric === key,
     onPress: () => setMetric(key),
@@ -979,9 +1349,9 @@ export function UsageSection({
         ) : null}
       </View>
 
-      {accountChips.length > 1 || accountId !== null || selectedModel ? (
+      {showAccountControls || accountId !== null || selectedModel ? (
         <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
-          {accountChips.length > 1 ? (
+          {showAccountControls ? (
             <>
               <Pressable
                 accessibilityRole="button"
@@ -1001,9 +1371,8 @@ export function UsageSection({
                   {t("stats.accountAll")}
                 </Text>
               </Pressable>
-              {accountChips.map((chip) => {
+              {accountEntries.map((chip) => {
                 const active = accountId === chip.accountId;
-                const label = displayLabel(chip.label, t, accountKindById.get(chip.accountId));
                 const costSuffix = chip.pricedRequests > 0 ? ` · ${usd(chip.cost, locale)}` : "";
                 return (
                   <Pressable
@@ -1022,7 +1391,7 @@ export function UsageSection({
                     }}
                   >
                     <Text style={{ ...font.caption, ...tabular, fontWeight: "500", color: active ? colors.accent : colors.foregroundMuted }}>
-                      {`${label} · ${integer(chip.requests, locale)}${costSuffix}`}
+                      {`${chip.label} · ${integer(chip.requests, locale)}${costSuffix}`}
                     </Text>
                   </Pressable>
                 );
@@ -1046,10 +1415,12 @@ export function UsageSection({
               }}
             >
               <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
-                {(() => {
-                  const matched = accounts.find((entry) => entry.id === accountId);
-                  return matched ? displayLabel(matched.label, t, matched.kind) : accountId;
-                })()}
+                {accountId === UNATTRIBUTED_ACCOUNT_ID
+                  ? t("stats.accountUnattributed")
+                  : (() => {
+                      const matched = accounts.find((entry) => entry.id === accountId);
+                      return matched ? displayLabel(matched.label, t, matched.kind) : accountId;
+                    })()}
               </Text>
               <Icon name="X" size={12} color={colors.accent} />
             </Pressable>
@@ -1179,20 +1550,31 @@ export function UsageSection({
           </Card>
         ) : null}
         {stats && stats.totals.requests > 0 ? (
-          <>
-            <MetricChart colors={colors} stats={stats} metric={metric} locale={locale} compact={compact || width < 640} />
-            {stats.models.length > 0 ? (
-              <ModelTable
-                colors={colors}
-                stats={stats}
-                locale={locale}
-                wide={width >= 820}
-                selectedModel={selectedModel}
-                onSelectModel={setSelectedModel}
-                onEditPricing={(pricingKey) => setPricingOpen({ open: true, focusKey: pricingKey })}
-              />
-            ) : null}
-          </>
+          <MetricChart colors={colors} stats={stats} metric={metric} locale={locale} compact={compact || width < 640} />
+        ) : null}
+        {stats && showAccountControls ? (
+          <AccountTable
+            colors={colors}
+            rowsData={accountEntries}
+            locale={locale}
+            wide={width >= 820}
+            selectedAccountId={accountId}
+            onSelectAccount={(next) => {
+              setAccountId(next);
+              setSelectedModel(null);
+            }}
+          />
+        ) : null}
+        {stats && stats.models.length > 0 ? (
+          <ModelTable
+            colors={colors}
+            stats={stats}
+            locale={locale}
+            wide={width >= 820}
+            selectedModel={selectedModel}
+            onSelectModel={setSelectedModel}
+            onEditPricing={(pricingKey) => setPricingOpen({ open: true, focusKey: pricingKey })}
+          />
         ) : null}
       </View>
 

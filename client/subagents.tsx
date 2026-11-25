@@ -61,7 +61,7 @@ const STATE_ICON: Record<ShownState, string> = {
 /** Which subagent a panel should show when it opens, per agent. */
 const requested = new Map<string, string>();
 
-export function useSubagents(agentId: string, enabled = true) {
+export function useSubagents(agentId: string, enabled = true, fastPoll = false) {
   const list = useRpc(listSubagentsRpc);
   return useQuery({
     queryKey: ["antigravity-accounts", "subagents", agentId],
@@ -69,7 +69,7 @@ export function useSubagents(agentId: string, enabled = true) {
     enabled,
     staleTime: 1000,
     refetchInterval: (query) =>
-      query.state.data?.subagents.some((subagent) => subagent.state === "running") ? 3000 : 15000,
+      fastPoll || query.state.data?.subagents.some((subagent) => subagent.state === "running") ? 3000 : 15000,
   });
 }
 
@@ -242,11 +242,11 @@ export function createSubagentViews(client: PluginClientContext) {
   function SubagentCardRow({ agentId, item, theme }: PluginTimelineItemProps<SubagentCard>) {
     const { colors } = theme;
     const { t, locale } = useTranslation(messages);
-    const query = useSubagents(agentId);
+    const card = item.data;
+    const query = useSubagents(agentId, true, card.status === "running");
     const pricing = usePricing();
     const overrides = pricing.data?.overrides ?? {};
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
-    const card = item.data;
     const summary = useMemo(() => {
       const subagents = query.data?.subagents;
       if (!subagents?.length) return undefined;
@@ -419,9 +419,13 @@ export function createSubagentViews(client: PluginClientContext) {
     const { colors } = theme;
     const { t } = useTranslation(messages);
     const agentId = params.agentId;
-    const agent = useAgent(agentId, (snapshot) => ({ provider: snapshot.provider, title: snapshot.title }));
-    const antigravity = isAntigravityProvider(agent?.provider);
-    const query = useSubagents(agentId, antigravity);
+    const agentInfo = useAgent(
+      agentId,
+      (snapshot) => `${snapshot.provider}|${snapshot.status === "running" || snapshot.status === "initializing" ? "1" : "0"}`,
+    );
+    const [agentProvider = "", agentBusy = "0"] = (agentInfo ?? "").split("|");
+    const antigravity = isAntigravityProvider(agentProvider);
+    const query = useSubagents(agentId, antigravity, agentBusy === "1");
     const list = query.data?.subagents ?? [];
     const [selected, setSelected] = useState<string | null>(null);
     const [filter, setFilter] = useState<ListFilter>("all");
@@ -476,7 +480,7 @@ export function createSubagentViews(client: PluginClientContext) {
           <>
             <View style={{ flexDirection: "row", gap: space.xs, flexWrap: "wrap" }}>
               <FilterChip colors={colors} label={t("subagents.filter.all")} active={filter === "all"} onPress={() => setFilter("all")} />
-              {running > 0 ? (
+              {running > 0 || filter === "running" ? (
                 <FilterChip
                   colors={colors}
                   label={`${t("subagents.filter.running")} (${running})`}
@@ -484,7 +488,7 @@ export function createSubagentViews(client: PluginClientContext) {
                   onPress={() => setFilter("running")}
                 />
               ) : null}
-              {failedCount > 0 ? (
+              {failedCount > 0 || filter === "failed" ? (
                 <FilterChip
                   colors={colors}
                   label={`${t("subagents.filter.failed")} (${failedCount})`}
@@ -767,8 +771,13 @@ function Detail({
     queryKey: ["antigravity-accounts", "subagent", agentId, summary.id],
     queryFn: () => read({ agentId, subagentId: summary.id }),
     staleTime: 1000,
+    placeholderData: (previous) => previous,
     refetchInterval: summary.state === "running" ? 3000 : false,
   });
+  const { refetch: refetchDetail } = query;
+  useEffect(() => {
+    void refetchDetail();
+  }, [summary.state, summary.steps, summary.reportedAt, summary.updatedAt, refetchDetail]);
   const detail = query.data;
   const entries = detail?.entries ?? [];
   const artifacts = detail?.artifacts ?? [];
@@ -827,7 +836,16 @@ function Detail({
     <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: space.xl }}>
       <View style={{ gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
-          <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? summary.type ?? summary.id.slice(0, 8)}</Text>
+          <Text
+            style={{
+              ...font.title,
+              fontSize: compact ? 18 : font.title.fontSize,
+              color: colors.foreground,
+              flexShrink: 1,
+            }}
+          >
+            {summary.role ?? summary.type ?? summary.id.slice(0, 8)}
+          </Text>
           {summary.type && summary.role ? <Badge colors={colors} label={summary.type} /> : null}
           <Badge colors={colors} label={t(`subagents.state.${summary.state}`)} tone={STATE_TONE[summary.state]} dot />
           <View style={{ flex: 1 }} />
@@ -837,7 +855,9 @@ function Detail({
               accessibilityLabel={t("subagents.copyTranscript")}
               onPress={() => {
                 const md = transcriptToMarkdown(summary, entries, detail?.report ?? null);
-                void copyText(md).then(() => toast.show(t("subagents.transcriptCopied"), { durationMs: 2500 }));
+                void copyText(md)
+                  .then(() => toast.show(t("subagents.transcriptCopied"), { durationMs: 2500 }))
+                  .catch((reason: unknown) => toast.error(errorMessage(reason)));
               }}
               style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
             >
@@ -882,7 +902,9 @@ function Detail({
                 accessibilityRole="button"
                 accessibilityLabel={t("subagents.copy")}
                 onPress={() => {
-                  void copyText(detail.report ?? "").then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }));
+                  void copyText(detail.report ?? "")
+                    .then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }))
+                    .catch((reason: unknown) => toast.error(errorMessage(reason)));
                 }}
                 style={{ padding: space.xs }}
               >

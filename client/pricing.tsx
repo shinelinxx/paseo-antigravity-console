@@ -186,7 +186,10 @@ function PricingRowEditor({
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded }}
-        onPress={() => setExpanded(!expanded)}
+        onPress={() => {
+          setError("");
+          setExpanded(!expanded);
+        }}
         style={(state) => ({
           flexDirection: "row",
           alignItems: "center",
@@ -242,8 +245,8 @@ function PricingRowEditor({
                 const i = parseRate(inputStr) ?? 0;
                 const c = parseRate(cachedStr) ?? 0;
                 const o = parseRate(outputStr) ?? 0;
-                setLongInputStr(String(i * 2));
-                setLongCachedStr(String(c * 2));
+                setLongInputStr(String(Number((i * 2).toFixed(4))));
+                setLongCachedStr(String(Number((c * 2).toFixed(4))));
                 setLongOutputStr(String(Number((o * 1.5).toFixed(4))));
               }
             }}
@@ -417,13 +420,33 @@ export function PricingDialog({
             </View>
             {addError ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={addError} /> : null}
             <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
-              <Button colors={colors} size="sm" variant="ghost" label={t("dialog.cancel")} disabled={addBusy} onPress={() => setAdding(false)} />
+              <Button
+                colors={colors}
+                size="sm"
+                variant="ghost"
+                label={t("dialog.cancel")}
+                disabled={addBusy}
+                onPress={() => {
+                  setAddError("");
+                  setAdding(false);
+                }}
+              />
               <Button colors={colors} size="sm" variant="primary" label={t("dialog.save")} loading={addBusy} onPress={() => void submitNew()} />
             </View>
           </View>
         ) : (
           <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
-            <Button colors={colors} size="sm" variant="secondary" icon="Plus" label={t("pricing.addModel")} onPress={() => setAdding(true)} />
+            <Button
+              colors={colors}
+              size="sm"
+              variant="secondary"
+              icon="Plus"
+              label={t("pricing.addModel")}
+              onPress={() => {
+                setAddError("");
+                setAdding(true);
+              }}
+            />
             {hasAnyCustom ? (
               <Button
                 colors={colors}

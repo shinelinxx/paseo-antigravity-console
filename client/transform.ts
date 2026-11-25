@@ -36,12 +36,13 @@ function extractChildId(output: unknown): string {
 
 /** The JSON list `manage_subagents` prints after "You have N active subagent(s):". */
 function listedStates(output: unknown): SubagentCheck["states"] {
-  if (typeof output !== "string") return [];
-  const start = output.indexOf("[");
-  const end = output.lastIndexOf("]");
+  const text = extractToolOutput(output);
+  if (!text) return [];
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
   if (start < 0 || end <= start) return [];
   try {
-    const parsed: unknown = JSON.parse(output.slice(start, end + 1));
+    const parsed: unknown = JSON.parse(text.slice(start, end + 1));
     if (!Array.isArray(parsed)) return [];
     return parsed.flatMap((entry) => {
       if (!entry || typeof entry !== "object") return [];
@@ -76,10 +77,9 @@ function killedStates(input: unknown, output: unknown): SubagentCheck["states"] 
   const ids = Array.isArray(record.ConversationIds)
     ? record.ConversationIds.filter((id): id is string => typeof id === "string")
     : [];
-  const roles =
-    typeof output === "string" ? (/Killed roles:\s*([^\n]+)/.exec(output)?.[1] ?? "").split(/,\s*/).filter(Boolean) : [];
-  const reportedCount =
-    typeof output === "string" ? Number(/killed\s+(\d+)\s+subagent/i.exec(output)?.[1] ?? 0) : 0;
+  const text = extractToolOutput(output);
+  const roles = text ? (/Killed roles:\s*([^\n]+)/.exec(text)?.[1] ?? "").split(/,\s*/).filter(Boolean) : [];
+  const reportedCount = text ? Number(/killed\s+(\d+)\s+subagent/i.exec(text)?.[1] ?? 0) : 0;
   const count = Math.max(ids.length, roles.length, Number.isFinite(reportedCount) ? reportedCount : 0);
   return Array.from({ length: count }, (_, index) => ({
     id: ids[index] ?? `#${index + 1}`,
@@ -174,11 +174,17 @@ export function registerSubagentTransforms(client: PluginClientContext) {
   const removeEchoTransform = client.addTimelineTransformer({
     id: "antigravity-ask-question-echo",
     query: { itemType: "assistant_message" },
-    transform({ item }) {
+    transform({ item, phase }) {
       if (knownQuestionEchoes.size === 0) return undefined;
       const normalized = normalizeEchoText(item.text);
-      if (normalized && knownQuestionEchoes.has(normalized)) {
+      if (!normalized) return undefined;
+      if (knownQuestionEchoes.has(normalized)) {
         return { items: [] };
+      }
+      if (phase === "streaming" && normalized.length >= 12) {
+        for (const echo of knownQuestionEchoes) {
+          if (echo.startsWith(normalized)) return { items: [] };
+        }
       }
       return undefined;
     },

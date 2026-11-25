@@ -49,6 +49,7 @@
     "monthly": "Monthly"
   },
   "resets": "Resets {{time}}",
+  "resetting": "Resetting soon",
   "off": "Off",
   "noQuota": "No quota reported",
   "action": {
@@ -146,6 +147,7 @@
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity account",
   "pillSignedOut": "Antigravity account (not signed in)",
+  "pillCooling": "Cooling down",
   "manage": "Manage accounts…",
   "now": "Switch now (interrupts the turn)",
   "after": "Switch after this turn",
@@ -205,6 +207,10 @@
     "costAvgCustom": "Avg {{avg}} / req · custom",
     "costWithUnpriced": "{{avg}} / req · {{unpriced}} unpriced",
     "accountAll": "All accounts",
+    "accountUnattributed": "Unattributed",
+    "accountsTable": "By account",
+    "accountsHint": "Tap an account to filter the whole dashboard",
+    "colAccount": "Account",
     "windowSince": "{{start}} – now",
     "filterModel": "Model: {{model}}",
     "splitSummary": "Main {{main}} · Subagents {{subagent}}",

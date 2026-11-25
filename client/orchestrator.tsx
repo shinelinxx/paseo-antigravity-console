@@ -1,7 +1,7 @@
 import { useRpc, useTranslation } from "@getpaseo/plugin/client";
 import { Modal, SettingsRow, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import {
   getOrchestratorRpc,
@@ -108,6 +108,14 @@ export function OrchestratorRows({
   const read = useRpc(getOrchestratorRpc);
   const save = useRpc(setOrchestratorRpc);
   const [retrying, setRetrying] = useState(false);
+  const accountSig = accounts.map((a) => `${a.id}:${a.status}:${a.email ?? ""}:${a.usable}`).join("|");
+  const prevAccountSigRef = useRef(accountSig);
+  useEffect(() => {
+    if (prevAccountSigRef.current !== accountSig) {
+      prevAccountSigRef.current = accountSig;
+      void cache.invalidateQueries({ queryKey: ORCHESTRATOR_QUERY_KEY });
+    }
+  }, [accountSig, cache]);
   const query = useQuery({ queryKey: ORCHESTRATOR_QUERY_KEY, queryFn: () => read({}), staleTime: 60_000 });
   const state = query.data;
 
@@ -232,19 +240,32 @@ export function AccountOrchestratorDialog({
   const [planner, setPlanner] = useState<string>(account.orchestratorOverride?.planner ?? DEFAULT_VALUE);
   const [executor, setExecutor] = useState<string>(account.orchestratorOverride?.executor ?? DEFAULT_VALUE);
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!account.orchestratorOverride && state && mode === "custom" && planner === DEFAULT_VALUE && executor === DEFAULT_VALUE) {
-      setPlanner(state.planner ?? DEFAULT_VALUE);
-      setExecutor(state.executor ?? DEFAULT_VALUE);
-    }
-  }, [account.orchestratorOverride, state, mode, planner, executor]);
+  const seededCustomRef = useRef(Boolean(account.orchestratorOverride));
 
   const accountPlanners = (state?.planners ?? []).filter((family) => family.accounts.includes(account.id));
   const accountExecutors = (state?.executors ?? []).filter((family) => family.accounts.includes(account.id));
   const plannerList = accountPlanners.length ? accountPlanners : (state?.planners ?? []);
   const executorList = accountExecutors.length ? accountExecutors : (state?.executors ?? []);
+
+  useEffect(() => {
+    if (!state || mode !== "custom") return;
+    const hasLabel = (list: readonly ModelFamily[], target: string | null) =>
+      Boolean(target && list.some((family) => family.variants.some((variant) => variant.label === target)));
+    if (!seededCustomRef.current) {
+      seededCustomRef.current = true;
+      setPlanner(hasLabel(plannerList, state.planner) ? state.planner! : DEFAULT_VALUE);
+      setExecutor(hasLabel(executorList, state.executor) ? state.executor! : DEFAULT_VALUE);
+      return;
+    }
+    if (planner !== DEFAULT_VALUE && plannerList.length > 0 && !hasLabel(plannerList, planner)) {
+      setPlanner(DEFAULT_VALUE);
+    }
+    if (executor !== DEFAULT_VALUE && executorList.length > 0 && !hasLabel(executorList, executor)) {
+      setExecutor(DEFAULT_VALUE);
+    }
+  }, [state, mode, plannerList, executorList, planner, executor]);
 
   async function submit() {
     if (busy) return;
@@ -293,28 +314,59 @@ export function AccountOrchestratorDialog({
         </View>
 
         {mode === "custom" && state ? (
-          <View style={{ gap: space.sm }}>
-            {plannerList.length ? (
-              <SettingsSelect
-                label={t("orchestrator.planner")}
-                value={planner}
-                options={options(plannerList, t("orchestrator.default"))}
-                onValueChange={setPlanner}
-                disabled={busy}
-              />
-            ) : null}
-            {executorList.length ? (
-              <SettingsSelect
-                label={t("orchestrator.executor")}
-                value={executor}
-                options={options(executorList, t("orchestrator.default"))}
-                onValueChange={setExecutor}
-                disabled={busy}
-              />
-            ) : null}
-          </View>
+          plannerList.length || executorList.length ? (
+            <View style={{ gap: space.sm }}>
+              {plannerList.length ? (
+                <SettingsSelect
+                  label={t("orchestrator.planner")}
+                  value={planner}
+                  options={options(plannerList, t("orchestrator.default"))}
+                  onValueChange={setPlanner}
+                  disabled={busy}
+                />
+              ) : null}
+              {executorList.length ? (
+                <SettingsSelect
+                  label={t("orchestrator.executor")}
+                  value={executor}
+                  options={options(executorList, t("orchestrator.default"))}
+                  onValueChange={setExecutor}
+                  disabled={busy}
+                />
+              ) : null}
+            </View>
+          ) : (
+            <Callout
+              colors={colors}
+              tone="warning"
+              icon="TriangleAlert"
+              title={state.error ?? t("orchestrator.slashNoMatch")}
+              action={
+                <Button
+                  colors={colors}
+                  size="sm"
+                  icon="RefreshCw"
+                  label={t("retry")}
+                  loading={retrying}
+                  disabled={busy}
+                  onPress={() => {
+                    setRetrying(true);
+                    void read({ refresh: true })
+                      .then((next) => {
+                        cache.setQueryData(ORCHESTRATOR_QUERY_KEY, next);
+                        onSaved(next);
+                      })
+                      .catch((reason: unknown) => setError(errorMessage(reason)))
+                      .finally(() => setRetrying(false));
+                  }}
+                />
+              }
+            />
+          )
         ) : mode === "custom" && query.isLoading ? (
           <Muted colors={colors}>{t("loading")}</Muted>
+        ) : mode === "custom" && query.error ? (
+          <Callout colors={colors} tone="danger" icon="CircleAlert" title={errorMessage(query.error)} />
         ) : state ? (
           <Text style={{ ...font.small, color: colors.foregroundMuted }}>
             {t("orchestrator.slashCurrent", {

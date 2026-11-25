@@ -48,6 +48,12 @@ function Meter({ colors, label, bucket, locale }: { colors: Colors; label: strin
   );
 }
 
+function isWindowDisabled(group: QuotaGroup | null, window: string): boolean {
+  if (!group) return false;
+  const matching = group.buckets.filter((bucket) => bucket.window.trim().toLowerCase() === window);
+  return matching.length > 0 && matching.every((bucket) => bucket.disabled);
+}
+
 /** Footer row: the default account's 5-hour and weekly quota left, as meters. */
 export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSidebarItemProps) {
   const { colors } = theme;
@@ -57,13 +63,21 @@ export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSid
   const group = account?.quota ? primaryGroup(account.quota) : null;
   const fiveHour = bucketFor(group, "5h");
   const weekly = bucketFor(group, "weekly");
+  const fiveHourDisabled = isWindowDisabled(group, "5h");
+  const weeklyDisabled = isWindowDisabled(group, "weekly");
+  const hideFiveHour = fiveHourDisabled && !fiveHour && Boolean(weekly || !weeklyDisabled);
+  const hideWeekly = weeklyDisabled && !weekly && Boolean(fiveHour);
+  const accountUnhealthy = Boolean(account && (!account.usable || account.status === "signed-out"));
   const active = currentScreen?.screenId === "accounts";
-  const describe = (bucket: QuotaBucket | null) =>
-    bucket?.remainingFraction === null || bucket?.remainingFraction === undefined ? "—" : percent(bucket.remainingFraction, locale);
+  const describe = (bucket: QuotaBucket | null, disabled: boolean) =>
+    disabled ? t("off") : bucket?.remainingFraction === null || bucket?.remainingFraction === undefined ? "—" : percent(bucket.remainingFraction, locale);
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={t("sidebar.label", { fiveHour: describe(fiveHour), weekly: describe(weekly) })}
+      accessibilityLabel={t("sidebar.label", {
+        fiveHour: describe(fiveHour, fiveHourDisabled),
+        weekly: describe(weekly, weeklyDisabled),
+      })}
       onPress={() => openScreen({ screenId: "accounts" })}
       style={(state) => ({
         width: "100%",
@@ -81,9 +95,13 @@ export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSid
             : "transparent",
       })}
     >
-      <Icon icon={{ svg: antigravityLogoSvg("sidebar") }} size={ICON_SIZE} color={colors.foregroundMuted} />
-      <Meter colors={colors} label="5H" bucket={fiveHour} locale={locale} />
-      <Meter colors={colors} label="7D" bucket={weekly} locale={locale} />
+      {accountUnhealthy ? (
+        <Icon name="AlertTriangle" size={ICON_SIZE} color={colors.statusWarning} />
+      ) : (
+        <Icon icon={{ svg: antigravityLogoSvg("sidebar") }} size={ICON_SIZE} color={colors.foregroundMuted} />
+      )}
+      {!hideFiveHour ? <Meter colors={colors} label="5H" bucket={fiveHour} locale={locale} /> : null}
+      {!hideWeekly ? <Meter colors={colors} label="7D" bucket={weekly} locale={locale} /> : null}
     </Pressable>
   );
 }

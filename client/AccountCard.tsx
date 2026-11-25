@@ -89,7 +89,11 @@ function Meter({
       <Bar colors={colors} fraction={bucket.disabled ? 0 : (fraction ?? 0)} tone={tone} height={5} />
       {/* Always one line tall, so cards with and without reset times line up. */}
       <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-        {bucket.resetTime && !bucket.disabled ? t("resets", { time: relative(bucket.resetTime, now, locale) }) : "\u00a0"}
+        {bucket.resetTime && !bucket.disabled
+          ? Date.parse(bucket.resetTime) <= now
+            ? t("resetting")
+            : t("resets", { time: relative(bucket.resetTime, now, locale) })
+          : "\u00a0"}
       </Text>
     </View>
   );
@@ -262,7 +266,9 @@ export function AccountCard({
   if (isProfile) {
     menuItems.push({ id: "orchestratorOverride", label: t("action.orchestratorOverride"), icon: "Workflow" });
     menuItems.push({ id: "recoverFiles", label: t("action.recoverFiles"), icon: "FolderInput" });
-    if (signedIn) menuItems.push({ id: "signIn", label: t("action.signInAgain"), icon: "LogIn" });
+    if (account.status !== "signed-out" || !account.usable) {
+      menuItems.push({ id: "signIn", label: t("action.signInAgain"), icon: "LogIn" });
+    }
     if (account.status !== "signed-out") menuItems.push({ id: "signOut", label: t("action.signOut"), icon: "LogOut" });
     menuItems.push({ id: "remove", label: t("action.remove"), icon: "Trash2", danger: true });
   }

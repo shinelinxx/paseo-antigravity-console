@@ -205,7 +205,10 @@ export function SignIn({
                 maxLength={16384}
                 editable={!busy && !expired && sessionAlive}
                 value={code}
-                onChangeText={setCode}
+                onChangeText={(value) => {
+                  setCode(value);
+                  if (sessionAlive && error) setError("");
+                }}
                 onSubmitEditing={() => void finish()}
                 placeholder={t("signin.placeholder")}
                 placeholderTextColor={tint(colors.foregroundMuted, 0.7)}

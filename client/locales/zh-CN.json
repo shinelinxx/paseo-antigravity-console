@@ -48,6 +48,7 @@
     "monthly": "每月"
   },
   "resets": "{{time}}重置",
+  "resetting": "即将重置",
   "off": "已停用",
   "noQuota": "没有额度数据",
   "action": {
@@ -141,6 +142,7 @@
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity 账号",
   "pillSignedOut": "Antigravity 账号（未登录）",
+  "pillCooling": "冷却中",
   "manage": "管理账号…",
   "now": "立即切换（会中断当前这一轮）",
   "after": "这一轮结束后切换",
@@ -200,6 +202,10 @@
     "costAvgCustom": "均价 {{avg}} / 次 · 自定义",
     "costWithUnpriced": "{{avg}} / 次 · {{unpriced}} 次未定价",
     "accountAll": "全部账号",
+    "accountUnattributed": "未归因",
+    "accountsTable": "按账号",
+    "accountsHint": "点击账号可筛选上方全部图表",
+    "colAccount": "账号",
     "windowSince": "{{start}} 至今",
     "filterModel": "模型：{{model}}",
     "splitSummary": "主对话 {{main}} · 子代理 {{subagent}}",

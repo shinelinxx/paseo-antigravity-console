@@ -187,10 +187,12 @@ function PendingQuestionForm({
   const parsedOptions = current.options.map(parseOption);
 
   const currentAnswered = isQuestionAnswered(current, selections[safeIndex], customTexts[safeIndex]);
-  const allAnswered = questions.every((entry, idx) =>
-    isQuestionAnswered(entry, selections[idx], customTexts[idx]),
+  const firstUnanswered = questions.findIndex(
+    (entry, idx) => !isQuestionAnswered(entry, selections[idx], customTexts[idx]),
   );
+  const allAnswered = firstUnanswered < 0;
   const isLast = safeIndex === questions.length - 1;
+  const shouldJumpUnanswered = isLast && currentAnswered && !allAnswered;
   const busy = submitting !== null;
 
   function toggleOption(qIndex: number, optIndex: number, multiSelect: boolean) {
@@ -274,12 +276,18 @@ function PendingQuestionForm({
 
   function handlePrimaryAction() {
     if (inFlightRef.current || busy) return;
-    if (!isLast) {
+    if (!isLast || shouldJumpUnanswered) {
       if (!currentAnswered) return;
       const nextUnanswered = questions.findIndex(
         (entry, idx) => idx > safeIndex && !isQuestionAnswered(entry, selections[idx], customTexts[idx]),
       );
-      setActiveIndex(nextUnanswered >= 0 ? nextUnanswered : Math.min(safeIndex + 1, questions.length - 1));
+      if (nextUnanswered >= 0) {
+        setActiveIndex(nextUnanswered);
+      } else if (firstUnanswered >= 0) {
+        setActiveIndex(firstUnanswered);
+      } else {
+        setActiveIndex(Math.min(safeIndex + 1, questions.length - 1));
+      }
       return;
     }
     void submitAnswer();
@@ -299,8 +307,8 @@ function PendingQuestionForm({
     toast.show(t("questions.insertedComposer"), { variant: "success" });
   }
 
-  const primaryDisabled = busy || (isLast ? !allAnswered : !currentAnswered);
-  const primaryLabel = isLast ? t("questions.submit") : t("questions.next");
+  const primaryDisabled = busy || (isLast && !shouldJumpUnanswered ? !allAnswered : !currentAnswered);
+  const primaryLabel = isLast && !shouldJumpUnanswered ? t("questions.submit") : t("questions.next");
 
   return (
     <Card colors={colors} style={{ padding: space.md, gap: space.md }}>
@@ -571,7 +579,7 @@ function PendingQuestionForm({
           {submitting === "submit" ? (
             <ActivityIndicator size="small" color={colors.accentForeground} />
           ) : (
-            <Icon name={isLast ? "Check" : "ArrowRight"} size={14} color={colors.accentForeground} />
+            <Icon name={isLast && !shouldJumpUnanswered ? "Check" : "ArrowRight"} size={14} color={colors.accentForeground} />
           )}
           <Text style={{ ...font.small, fontWeight: "600", color: colors.accentForeground }}>
             {primaryLabel}
@@ -629,7 +637,11 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       const idx = data.entries.findIndex(
         (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
       );
-      if (idx < 0) return data.hasOlder ? false : 3000;
+      if (idx < 0) {
+        const recent =
+          Date.now() - timestamp.getTime() < 20_000 || query.state.dataUpdatedAt <= timestamp.getTime() + 1500;
+        return recent ? 1500 : data.hasOlder ? false : 3000;
+      }
       for (let cursor = idx + 1; cursor < data.entries.length; cursor += 1) {
         const next = data.entries[cursor]!.item;
         if (next.type === "user_message") return false;
@@ -644,12 +656,22 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
     },
   });
 
-  const { refetch: refetchTimeline } = timelineQuery;
+  const { refetch: refetchTimeline, dataUpdatedAt, isFetching } = timelineQuery;
   useEffect(() => {
     if (needsTimelineCheck && lastActivityAt) {
       void refetchTimeline();
     }
   }, [needsTimelineCheck, lastActivityAt, refetchTimeline]);
+
+  useEffect(() => {
+    if (!needsTimelineCheck || !timelineQuery.data) return;
+    const present = timelineQuery.data.entries.some(
+      (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
+    );
+    if (!present && dataUpdatedAt <= timestamp.getTime() + 1500) {
+      void refetchTimeline();
+    }
+  }, [needsTimelineCheck, timelineQuery.data, dataUpdatedAt, timestamp, callId, refetchTimeline]);
 
   const resolved: QuestionResolution = useMemo(() => {
     if (effectiveResolution) return effectiveResolution;
@@ -676,6 +698,9 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
     );
     if (index < 0) {
+      const recent =
+        isFetching || Date.now() - timestamp.getTime() < 20_000 || dataUpdatedAt <= timestamp.getTime() + 1500;
+      if (recent) return { state: "pending" };
       return data.hasOlder ? { state: "settled" } : { state: "pending" };
     }
 
@@ -701,12 +726,26 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
     allowStreamingEcho,
     timelineQuery.data,
     timelineQuery.isError,
+    isFetching,
+    dataUpdatedAt,
     timestamp,
     lastActivityAt,
     callId,
     questions,
     echoSignature,
   ]);
+
+  // Cache terminal timeline resolutions so historical cards stop polling on later streaming turns.
+  useEffect(() => {
+    if (
+      !effectiveResolution &&
+      !outputResolution &&
+      (resolved.state === "answered" || resolved.state === "skipped" || resolved.state === "settled")
+    ) {
+      rememberSubmitted(cacheKey, resolved);
+      setLocalResolution(resolved);
+    }
+  }, [cacheKey, effectiveResolution, outputResolution, resolved]);
 
   if (questions.length === 0) return null;
 

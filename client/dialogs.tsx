@@ -11,7 +11,7 @@ import {
   type SavedFiles,
 } from "../shared/contracts";
 import type { ObservedAgent } from "./agents";
-import { displayLabel } from "./labels";
+import { displayLabel, shortPlan } from "./labels";
 import { errorMessage, messages } from "./messages";
 import { font, mono, radius, space, tint, type Colors } from "./theme";
 import { Badge, Button, Callout, Divider, Muted } from "./ui";
@@ -346,7 +346,11 @@ export function AccountAgentsDialog({
         skipped: result.skipped,
       });
       if (result.failed.length > 0) {
-        setError(`${summary} ${t("dialog.migrateFailed", { count: result.failed.length })}`);
+        const details = result.failed
+          .slice(0, 3)
+          .map((item) => `${item.title?.trim() || item.agentId.slice(0, 12)}: ${item.error}`)
+          .join("\n");
+        setError(`${summary} ${t("dialog.migrateFailed", { count: result.failed.length })}\n${details}`);
         setBusy(false);
       } else {
         toast.show(summary, { variant: "success", durationMs: 6000 });
@@ -428,10 +432,13 @@ export function AccountAgentsDialog({
                 <SettingsSelect
                   label={t("dialog.migrateTarget")}
                   value={targetId}
-                  options={targets.map((entry) => ({
-                    value: entry.id,
-                    label: [displayLabel(entry.label, t, entry.kind), entry.plan].filter(Boolean).join(" · "),
-                  }))}
+                  options={targets.map((entry) => {
+                    const name = displayLabel(entry.label, t, entry.kind);
+                    return {
+                      value: entry.id,
+                      label: [name, shortPlan(entry.plan, name)].filter(Boolean).join(" · "),
+                    };
+                  })}
                   onValueChange={setTargetId}
                   disabled={busy}
                 />

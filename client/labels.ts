@@ -13,6 +13,15 @@ export function displayLabel(
   return label === DEFAULT_SYSTEM_LABEL ? translate("systemName") : label;
 }
 
+/** Shortens a plan label for compact pickers and omits it when the account label already says it. */
+export function shortPlan(plan: string | null | undefined, label: string): string | null {
+  if (!plan) return null;
+  const compact = plan.replace(/^Google\s+AI\s+/i, "").trim();
+  if (!compact) return null;
+  if (label.toLowerCase().includes(compact.toLowerCase())) return null;
+  return compact;
+}
+
 /** Formats a list of names using locale-appropriate punctuation (e.g. `, ` in English, `、` in Chinese). */
 export function joinList(items: readonly string[], locale: string): string {
   if (items.length <= 1) return items[0] ?? "";

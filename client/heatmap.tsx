@@ -288,6 +288,24 @@ export function ActivityCalendar({
   // A cell index means a different day once the number of weeks changes.
   useEffect(() => setActive(null), [weeks]);
   const levelColor = (level: Level) => (level === 0 ? tint(colors.foreground, 0.07) : tint(colors.accent, LEVEL_ALPHA[level]));
+  const monthLabels = useMemo(() => {
+    const placed: Array<{ key: string; left: number; label: string }> = [];
+    const maxLeft = Math.max(0, gridWidth - 28);
+    for (const month of calendar.months) {
+      const left = Math.min(month.column * pitch, maxLeft);
+      const prev = placed[placed.length - 1];
+      if (prev && left - prev.left < 30) {
+        // Keep the newer month label when the first column's fallback label would crowd it, else drop the clamped edge label.
+        if (prev.left === 0 && month.column < calendar.columns.length - 2) {
+          placed[placed.length - 1] = { key: `${month.column}-${month.label}`, left, label: month.label };
+        }
+        continue;
+      }
+      placed.push({ key: `${month.column}-${month.label}`, left, label: month.label });
+    }
+    return placed;
+  }, [calendar.months, calendar.columns.length, gridWidth, pitch]);
+
   const gridHeight = MONTH_ROW + 7 * pitch;
 
   const activeColumn = active === null ? -1 : Math.floor(active / 7);
@@ -354,11 +372,18 @@ export function ActivityCalendar({
           )}
         </View>
         <View style={{ width: gridWidth, height: gridHeight }}>
-          {calendar.months.map((month) => (
+          {monthLabels.map((month) => (
             <Text
-              key={`${month.column}-${month.label}`}
+              key={month.key}
               numberOfLines={1}
-              style={{ position: "absolute", left: month.column * pitch, top: 0, fontSize: 11, lineHeight: 14, color: colors.foregroundMuted }}
+              style={{
+                position: "absolute",
+                left: month.left,
+                top: 0,
+                fontSize: 11,
+                lineHeight: 14,
+                color: colors.foregroundMuted,
+              }}
             >
               {month.label}
             </Text>

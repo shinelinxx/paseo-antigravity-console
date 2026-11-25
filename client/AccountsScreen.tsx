@@ -196,6 +196,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const padding = compact ? space.lg : space.xxl;
   const gap = compact ? space.md : space.lg;
   const contentWidth = Math.min(Math.max(width - padding * 2, 0), 980);
+  const menuBackdropInset = Math.max(padding, (width - contentWidth) / 2);
   const columns = contentWidth >= 820 ? 2 : 1;
   const cardWidth = columns === 2 ? (contentWidth - gap) / 2 : contentWidth;
   const profiles = data?.accounts.filter((account) => account.kind === "profile") ?? [];
@@ -208,15 +209,24 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface0 }} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding, alignItems: "center" }}>
-        {openMenuId && !useModalMenu ? (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={t("dialog.close")}
-            onPress={() => setOpenMenuId(null)}
-            style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, zIndex: 15 }}
-          />
-        ) : null}
         <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: compact ? space.xxl : space.xxxl }}>
+          {/* React Native Web gives this View its own stacking context. Keep the backdrop
+              beside the account section so the account menu can layer above it. */}
+          {openMenuId && !useModalMenu ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t("dialog.close")}
+              onPress={() => setOpenMenuId(null)}
+              style={{
+                position: "absolute",
+                top: -padding,
+                left: -menuBackdropInset,
+                right: -menuBackdropInset,
+                bottom: -padding,
+                zIndex: 15,
+              }}
+            />
+          ) : null}
           <View style={{ flexDirection: "row", alignItems: "center", gap: compact ? space.md : space.lg }}>
             <Avatar colors={colors} label="A" logo={antigravityLogoSvg("header")} size={compact ? 38 : 48} />
             <Text
@@ -333,7 +343,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   label={t("overview.default")}
                   value={data.defaultAccountId}
                   options={data.accounts
-                    .filter((account) => account.usable)
+                    .filter((account) => account.usable || account.id === data.defaultAccountId)
                     .map((account) => ({ value: account.id, label: displayLabel(account.label, t, account.kind) }))}
                   onValueChange={(accountId) => {
                     void setDefault({ accountId })
