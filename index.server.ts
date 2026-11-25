@@ -58,12 +58,25 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3000);
 
-  // Keep quota fresh for the sidebar: the default account often, every account now and then.
+  // Keep quota fresh for the sidebar and clear past reset windows promptly.
   const quotaTimer = setInterval(() => {
     void ready
       .then(async () => {
         const state = await service.state();
-        await service.refreshOne(state.defaultAccountId);
+        const now = Date.now();
+        const due = new Set<string>([state.defaultAccountId]);
+        for (const account of state.accounts) {
+          if (!account.usable || account.status !== "signed-in" || !account.quota) continue;
+          const expired = account.quota.some((group) =>
+            group.buckets.some((bucket) => {
+              if (bucket.disabled || !bucket.resetTime) return false;
+              const resetAt = Date.parse(bucket.resetTime);
+              return Number.isFinite(resetAt) && resetAt <= now;
+            }),
+          );
+          if (expired) due.add(account.id);
+        }
+        await Promise.all([...due].map((id) => service.refreshOne(id)));
       })
       .catch(() => undefined);
   }, 3 * 60_000);
@@ -73,7 +86,11 @@ export default function contribute(server: PluginServerContext) {
 
   const fallback = new FallbackController(service, pending, orchestrator);
   const removers = registerHooks(server, service, pending, fallback, {
-    onConversationAccount: (conversationId, accountId) => stats.recordConversationAccount(conversationId, accountId),
+    onConversationTurnStart: (agentId, conversationId, accountId, startedAt) =>
+      stats.beginConversationTurn(agentId, conversationId, accountId, startedAt),
+    onConversationTurnEnd: (agentId) => stats.endConversationTurn(agentId),
+    onConversationTurn: (conversationId, accountId, startedAt, endedAt) =>
+      stats.recordConversationTurn(conversationId, accountId, startedAt, endedAt),
     onAgentArchived: (agentId) => {
       context.forget(agentId);
       subagents.forget(agentId);
@@ -135,6 +152,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setFallbackRpc, async (patch) => {
     await ready;
     await service.setFallback(patch);
+    if (patch.enabled === false) fallback.cancelAllRetries();
     return service.state();
   });
 
@@ -157,17 +175,19 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(removeAccountRpc, async ({ accountId }) => {
     await ready;
+    pending.cancelTarget(accountId);
+    const moved = await service.remove(accountId);
     fallback.clearCooldown(accountId);
     orchestrator.invalidateAccount(accountId);
-    const moved = await service.remove(accountId);
     return { state: await service.state(), moved };
   });
 
   server.handle(signOutAccountRpc, async ({ accountId }) => {
     await ready;
+    pending.cancelTarget(accountId);
+    await service.signOut(accountId);
     fallback.clearCooldown(accountId);
     orchestrator.invalidateAccount(accountId);
-    await service.signOut(accountId);
     return service.state();
   });
 
@@ -194,14 +214,17 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(switchAgentAccountRpc, async (input, { paseo }) => {
     await ready;
-    fallback.clearCooldown(input.accountId);
-    return switchAgentAccount(paseo, service, pending, { ...input, manual: true });
+    fallback.cancelAgent(input.agentId);
+    const outcome = await switchAgentAccount(paseo, service, pending, { ...input, manual: true });
+    if (outcome.result !== "unchanged") fallback.clearCooldown(input.accountId);
+    return outcome;
   });
 
   server.handle(migrateAccountAgentsRpc, async (input, { paseo }) => {
     await ready;
-    fallback.clearCooldown(input.toAccountId);
-    return migrateAccountAgents(paseo, service, pending, input);
+    const outcome = await migrateAccountAgents(paseo, service, pending, input, (agentId) => fallback.cancelAgent(agentId));
+    if (outcome.switched > 0 || outcome.scheduled > 0) fallback.clearCooldown(input.toAccountId);
+    return outcome;
   });
 
   server.handle(usageStatsRpc, async (filter) => {
@@ -264,13 +287,12 @@ export default function contribute(server: PluginServerContext) {
     void ready.then(() => push({ revision: service.currentRevision() })).catch(() => undefined);
   });
 
-  return () => {
+  return async () => {
     clearTimeout(warmup);
     clearInterval(quotaTimer);
     clearInterval(sweepTimer);
     for (const remove of removers) remove();
     fallback.dispose();
-    stats.dispose();
-    service.dispose();
+    await Promise.all([service.dispose(), stats.dispose()]);
   };
 }

@@ -155,16 +155,46 @@ export class OrchestratorSettings {
     this.failures.delete(accountId);
   }
 
+  private currentIdentity(accountId: string): string {
+    const email =
+      accountId === SYSTEM_ACCOUNT_ID
+        ? this.service.store.snapshot().systemEmail
+        : (this.service.store.get(accountId)?.email ?? null);
+    return email ?? "";
+  }
+
   /**
    * Whether `accountId` is known to support `model`. Returns `null` when the account's model
-   * catalog has not been fetched yet so callers do not falsely block an unchecked account.
+   * catalog has not been fetched yet (or belongs to another sign-in) so callers do not falsely block it.
    */
   supportsModel(accountId: string, model: string | null | undefined): boolean | null {
     if (!model) return null;
     const cached = this.catalogs.get(accountId);
     if (!cached) return null;
+    const identity = this.currentIdentity(accountId);
+    if (identity && cached.identity && cached.identity !== identity) return null;
     const normalized = model.trim().toLowerCase().replace(/^antigravity\//, "");
-    return cached.models.some((entry) => entry.id.toLowerCase() === normalized || entry.label.toLowerCase() === normalized);
+    const family = normalized.replace(EFFORT_SUFFIX, "");
+    return cached.models.some((entry) => {
+      const id = entry.id.toLowerCase();
+      const label = entry.label.toLowerCase();
+      return id === normalized || label === normalized || id.replace(EFFORT_SUFFIX, "") === family;
+    });
+  }
+
+  /**
+   * Like `supportsModel`, but lazily fetches `agy models` (honoring cache & failure backoff) when
+   * the account's catalog is missing or stale, so fallback checks real model availability.
+   */
+  async ensureModelSupport(accountId: string, model: string | null | undefined): Promise<boolean | null> {
+    if (!model) return null;
+    const identity = this.currentIdentity(accountId);
+    const cached = this.catalogs.get(accountId);
+    const fresh = cached && cached.identity === identity && Date.now() - cached.fetchedAt < CATALOG_TTL_MS;
+    if (!fresh) {
+      await this.catalog(accountId, identity, false).catch(() => null);
+    }
+    return this.supportsModel(accountId, model);
   }
 
   private catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {
@@ -177,6 +207,9 @@ export class OrchestratorSettings {
     const inflight = this.fetching.get(accountId);
     if (inflight) return inflight;
     const task = (async () => {
+      if (accountId !== SYSTEM_ACCOUNT_ID && !(await this.service.hasSignInFile(accountId))) {
+        return null;
+      }
       const agy = await resolveAgy();
       if (!agy) throw new Error("Antigravity CLI (agy) was not found.");
       if (accountId !== SYSTEM_ACCOUNT_ID) await this.service.ensureAccountProfile(accountId);
@@ -268,7 +301,10 @@ export class OrchestratorSettings {
     if (update.executor && !known(state.executors, update.executor)) {
       throw new Error(`${update.executor} is not an executor model your accounts can use.`);
     }
-    if (update.accountId && update.accountId !== SYSTEM_ACCOUNT_ID) {
+    if (update.accountId === SYSTEM_ACCOUNT_ID) {
+      throw new Error("The system account uses the global Orchestrator setting.");
+    }
+    if (update.accountId) {
       if (update.inheritGlobal) {
         await this.service.setAccountOptions(update.accountId, { orchestratorOverride: null });
         return this.state();
@@ -335,8 +371,8 @@ export class OrchestratorSettings {
 
   register(server: PluginServerContext): Array<() => void> {
     return [
-      this.service.onStatusUpdated(({ accountId, signedInChanged }) => {
-        if (signedInChanged) this.invalidateAccount(accountId);
+      this.service.onStatusUpdated(({ accountId, signedInChanged, emailChanged }) => {
+        if (signedInChanged || emailChanged) this.invalidateAccount(accountId);
       }),
       server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
         if (!this.pendingReloads.has(agent.id)) return;

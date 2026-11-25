@@ -55,6 +55,7 @@ interface AccountCooldownState {
 
 export interface ModelSupport {
   supportsModel(accountId: string, model: string | null | undefined): boolean | null;
+  ensureModelSupport?(accountId: string, model: string | null | undefined): Promise<boolean | null>;
 }
 
 /** Picks the QuotaGroup matching a model pool (`gemini` vs `third-party`). */
@@ -73,17 +74,18 @@ export function groupForPool(
   return groups.find((group) => /gemini/i.test(group.name) && !/argon/i.test(group.name)) ?? groups[0] ?? null;
 }
 
-/** Earliest reset among exhausted buckets in the target pool, else null. */
+/** Earliest future reset among exhausted buckets in the target pool, else null. */
 export function resetOfExhausted(
   groups: readonly QuotaGroup[] | null,
   pool: "gemini" | "third-party",
+  now = Date.now(),
 ): number | null {
   const group = groupForPool(groups, pool);
   let earliest: number | null = null;
   for (const bucket of group?.buckets ?? []) {
     if (bucket.disabled || bucket.remainingFraction === null || bucket.remainingFraction > 0.001) continue;
     const at = bucket.resetTime ? Date.parse(bucket.resetTime) : NaN;
-    if (Number.isFinite(at) && (earliest === null || at < earliest)) earliest = at;
+    if (Number.isFinite(at) && at > now && (earliest === null || at < earliest)) earliest = at;
   }
   return earliest;
 }
@@ -92,31 +94,55 @@ export function resetOfExhausted(
 export function exhausted(
   groups: readonly QuotaGroup[] | null,
   pool: "gemini" | "third-party",
+  now = Date.now(),
 ): boolean {
   const group = groupForPool(groups, pool);
-  return (group?.buckets ?? []).some(
-    (bucket) => !bucket.disabled && bucket.remainingFraction !== null && bucket.remainingFraction <= 0.001,
-  );
+  return (group?.buckets ?? []).some((bucket) => {
+    if (bucket.disabled || bucket.remainingFraction === null || bucket.remainingFraction > 0.001) return false;
+    // A bucket whose reset time has already passed is stale, not still exhausted.
+    const resetAt = bucket.resetTime ? Date.parse(bucket.resetTime) : NaN;
+    if (Number.isFinite(resetAt) && resetAt <= now) return false;
+    return true;
+  });
+}
+
+/** True when any active bucket has a reset timestamp that has already passed. */
+function hasExpiredReset(groups: readonly QuotaGroup[] | null, now = Date.now()): boolean {
+  for (const group of groups ?? []) {
+    for (const bucket of group.buckets) {
+      if (bucket.disabled || !bucket.resetTime) continue;
+      const resetAt = Date.parse(bucket.resetTime);
+      if (Number.isFinite(resetAt) && resetAt <= now) return true;
+    }
+  }
+  return false;
 }
 
 /** Minimum remaining fraction (0..1) across active buckets of `pool`, or -1 when unknown. */
-function poolRemainingScore(groups: readonly QuotaGroup[] | null, pool: "gemini" | "third-party"): number {
+function poolRemainingScore(
+  groups: readonly QuotaGroup[] | null,
+  pool: "gemini" | "third-party",
+  now = Date.now(),
+): number {
   const group = groupForPool(groups, pool);
   const fractions = (group?.buckets ?? [])
     .filter((bucket) => !bucket.disabled && bucket.remainingFraction !== null)
-    .map((bucket) => bucket.remainingFraction!);
+    .map((bucket) => {
+      const resetAt = bucket.resetTime ? Date.parse(bucket.resetTime) : NaN;
+      return Number.isFinite(resetAt) && resetAt <= now ? 1 : bucket.remainingFraction!;
+    });
   if (!fractions.length) return -1;
   return Math.min(...fractions);
 }
 
-/** Earliest reset timestamp among active non-empty buckets of `pool`, or Infinity when unknown. */
-function poolSoonestReset(groups: readonly QuotaGroup[] | null, pool: "gemini" | "third-party"): number {
+/** Earliest future reset timestamp among active non-empty buckets of `pool`, or Infinity when unknown. */
+function poolSoonestReset(groups: readonly QuotaGroup[] | null, pool: "gemini" | "third-party", now = Date.now()): number {
   const group = groupForPool(groups, pool);
   let soonest = Infinity;
   for (const bucket of group?.buckets ?? []) {
     if (bucket.disabled || !bucket.resetTime) continue;
     const at = Date.parse(bucket.resetTime);
-    if (Number.isFinite(at) && at < soonest) soonest = at;
+    if (Number.isFinite(at) && at > now && at < soonest) soonest = at;
   }
   return soonest;
 }
@@ -213,6 +239,19 @@ export class FallbackController {
     if (changed) this.service.notifyChange();
   }
 
+  /** Cancels any pending automatic retry and resets the failure chain for an agent (e.g. manual switch). */
+  cancelAgent(agentId: string): void {
+    this.cancelRetry(agentId);
+    this.chains.delete(agentId);
+  }
+
+  /** Cancels all pending automatic retries and clears active failure chains (e.g. fallback turned off). */
+  cancelAllRetries(): void {
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
+    this.chains.clear();
+  }
+
   private cancelRetry(agentId: string): void {
     const timer = this.retryTimers.get(agentId);
     if (timer) {
@@ -237,7 +276,7 @@ export class FallbackController {
       server.addHook("agent.turn.after", async ({ agent, outcome }, { paseo }) => {
         if (!isAntigravityProvider(agent.provider)) return;
         this.cancelRetry(agent.id);
-        if (outcome.kind !== "failed") {
+        if (outcome.kind !== "failed" || this.pending.has(agent.id) || this.pending.isManual(agent.id)) {
           // A finished or canceled turn ends the chain; the user decides what happens next.
           this.chains.delete(agent.id);
           return;
@@ -250,11 +289,15 @@ export class FallbackController {
             .ref(agent.id)
             .refresh()
             .catch(() => null);
+          if (this.pending.has(agent.id) || this.pending.isManual(agent.id)) return;
           const model = snapshot?.agent.model ?? null;
+          const activeAccount =
+            this.pending.sessionAccountOf(agent.id) ??
+            accountIdFromMetadata(snapshot?.agent.metadata ?? agent.metadata);
           await this.handleFailure(
             paseo,
             agent.id,
-            accountIdFromMetadata(agent.metadata),
+            activeAccount,
             model,
             outcome.error,
             settings.retries,
@@ -324,7 +367,12 @@ export class FallbackController {
       }
       chain.tried.add(next);
       try {
-        await switchAgentAccount(paseo, this.service, this.pending, { agentId, accountId: next, when: "now" });
+        await switchAgentAccount(paseo, this.service, this.pending, {
+          agentId,
+          accountId: next,
+          when: "now",
+          skipOpenRedirect: true,
+        });
       } catch (switchError) {
         console.warn(
           `antigravity-accounts: fallback candidate ${next} could not take ${agentId}:`,
@@ -377,15 +425,19 @@ export class FallbackController {
       if (this.activeCooldown(id, pool)) continue;
       if (!account.usable || account.status === "signed-out") continue;
       if (this.models?.supportsModel(id, model) === false) continue;
-      if (id !== SYSTEM_ACCOUNT_ID && account.status === "unknown") {
-        // Never checked: look once before sending work there.
+      if (account.status === "unknown" || hasExpiredReset(this.service.knownQuota(id))) {
+        // Never checked or past a quota reset window: refresh once before evaluating.
         await this.service.refreshOne(id).catch(() => undefined);
       }
       const known = this.service.knownQuota(id);
       if (exhausted(known, pool)) continue;
       const fresh = (await this.service.state()).accounts.find((entry) => entry.id === id);
       if (!fresh || fresh.status === "signed-out" || !fresh.usable || !fresh.fallbackEnabled) continue;
-      if (this.models?.supportsModel(id, model) === false) continue;
+      if (id !== SYSTEM_ACCOUNT_ID && !(await this.service.hasSignInFile(id))) continue;
+      const supported = this.models?.ensureModelSupport
+        ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
+        : (this.models?.supportsModel(id, model) ?? null);
+      if (supported === false) continue;
       candidates.push({
         id,
         orderIndex: index,
@@ -405,7 +457,7 @@ export class FallbackController {
 
   /**
    * Why an account cannot take a session right now, or null. Uses only what is already known:
-   * a missing sign-in file, a signed-out or unsafe account, an exhausted quota, or a cooldown.
+   * a missing sign-in file, a signed-out or unsafe account, an unsupported model, an exhausted quota, or a cooldown.
    */
   async healthOf(accountId: string, model?: string | null): Promise<FailureKind | null> {
     const pool = quotaPoolForModel(model);
@@ -415,6 +467,7 @@ export class FallbackController {
     const account = state.accounts.find((entry) => entry.id === accountId);
     if (!account || !account.usable || account.status === "signed-out") return "auth";
     if (account.kind === "profile" && !(await this.service.hasSignInFile(accountId))) return "auth";
+    if (this.models?.supportsModel(accountId, model) === false) return "error";
     if (exhausted(this.service.knownQuota(accountId), pool)) return "quota";
     return null;
   }

@@ -34,31 +34,51 @@ function shortWindow(window: string): string {
   return window.trim();
 }
 
+/** Matches Paseo's built-in Antigravity Usage labels (e.g. "Gemini · Weekly", "Claude and GPT · 5h"). */
+function displayWindow(window: string, bucketName: string, sameWindowCount: number): string {
+  const normalized = window.trim().toLowerCase();
+  let base: string;
+  if (normalized === "weekly") base = "Weekly";
+  else if (normalized === "5h") base = "5h";
+  else if (normalized === "daily") base = "Daily";
+  else if (normalized === "monthly") base = "Monthly";
+  else base = window.trim() || bucketName.replace(/\s*limit\s*remaining$/i, "").trim();
+  if (sameWindowCount > 1) {
+    const cleaned = bucketName.replace(/\s*limit\s*remaining$/i, "").trim();
+    if (cleaned && cleaned.toLowerCase() !== base.toLowerCase()) return `${base} · ${cleaned}`;
+  }
+  return base;
+}
+
 function shortGroup(name: string): string {
   return name.trim().replace(/\s+models$/i, "").trim();
 }
 
 export function quotaWindows(groups: readonly QuotaGroup[]): UsageWindow[] {
   const includeGroup = groups.length > 1;
-  return groups.flatMap((group) =>
-    group.buckets.flatMap((bucket) => {
+  return groups.flatMap((group) => {
+    const groupLabel = shortGroup(group.name) || group.name.trim();
+    return group.buckets.flatMap((bucket) => {
       if (!bucket.disabled && bucket.remainingFraction === null) return [];
       const used = bucket.disabled || bucket.remainingFraction === null ? null : (1 - bucket.remainingFraction) * 100;
+      const normalizedWindow = bucket.window.trim().toLowerCase();
+      const sameCount = group.buckets.filter((other) => other.window.trim().toLowerCase() === normalizedWindow).length;
       const period = shortWindow(bucket.window);
+      const windowLabel = displayWindow(bucket.window, bucket.name, sameCount);
       return [
         windowFromUsedPct({
           id: bucket.id,
-          label: `${group.name} · ${bucket.name}${bucket.disabled ? " · Disabled" : ""}`,
-          shortLabel: includeGroup ? `${shortGroup(group.name)} ${period}`.trim() : period,
-          summary: !bucket.disabled && bucket.window.trim().toLowerCase() === "weekly",
+          label: `${groupLabel} · ${windowLabel}${bucket.disabled ? " · Off" : ""}`,
+          shortLabel: includeGroup ? `${groupLabel} ${period}`.trim() : period,
+          summary: !bucket.disabled && normalizedWindow === "weekly",
           utilizationPct: used,
-          durationSeconds: WINDOW_SECONDS[bucket.window.trim().toLowerCase()],
+          durationSeconds: WINDOW_SECONDS[normalizedWindow],
           resetsAt: bucket.disabled ? null : bucket.resetTime,
           tone: used === null ? "default" : toneFromUsedPct(used),
         }),
       ];
-    }),
-  );
+    });
+  });
 }
 
 /**
@@ -87,8 +107,12 @@ export function createUsageSource(service: AccountService): UsageSourceRegistrat
     async fetch(value: unknown) {
       await service.init();
       const { accountId } = input.parse(value);
-      if (accountId !== SYSTEM_ACCOUNT_ID && !service.store.get(accountId)) {
+      const account = accountId === SYSTEM_ACCOUNT_ID ? null : service.store.get(accountId);
+      if (accountId !== SYSTEM_ACCOUNT_ID && !account) {
         throw new Error("This Antigravity account was removed.");
+      }
+      if (account?.unsafeDetail) {
+        return { status: "error", error: account.unsafeDetail };
       }
       const status = await service.quotaFor(accountId, 60_000);
       if (status.status === "signed-in" && status.quota) {

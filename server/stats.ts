@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   DAILY_HISTORY_DAYS,
+  UNATTRIBUTED_ACCOUNT_ID,
+  accountIdSchema,
   type StatsRange,
   type StatsScope,
   type UsageDaily,
@@ -64,8 +66,44 @@ const RANGES: Record<StatsRange, { binMs: number; bins: number }> = {
   "30d": { binMs: 86_400_000, bins: 30 },
 };
 
-const SUBAGENT_MARKER = /sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-const attributionFile = () => path.join(dataDir(), "conversation-accounts.json");
+const SUBAGENT_MARKER = /sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+const attributionFile = () => path.join(dataDir(), "conversation-turn-accounts.json");
+
+interface TurnAccount {
+  startedAt: number;
+  endedAt: number;
+  accountId: string;
+}
+
+function isTurnAccount(value: unknown): value is TurnAccount {
+  if (typeof value !== "object" || value === null) return false;
+  const { startedAt, endedAt, accountId } = value as Partial<TurnAccount>;
+  return typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0 &&
+    typeof endedAt === "number" && Number.isFinite(endedAt) && endedAt >= startedAt &&
+    accountIdSchema.safeParse(accountId).success;
+}
+
+/** Allows for slight IPC dispatch delay on `agent.turn.before` (`waits: false`) vs SQLite step timestamps. */
+const TURN_START_SKEW_MS = 2000;
+
+function accountForGeneration(turns: readonly TurnAccount[], startedAt: number): string | null {
+  let exact: string | null = null;
+  for (const turn of turns) {
+    if (turn.startedAt > startedAt) break;
+    if (turn.endedAt < startedAt) continue;
+    if (exact !== null && exact !== turn.accountId) return null;
+    exact = turn.accountId;
+  }
+  if (exact !== null) return exact;
+  let skewed: string | null = null;
+  for (const turn of turns) {
+    if (turn.startedAt - TURN_START_SKEW_MS > startedAt) break;
+    if (turn.endedAt < startedAt) continue;
+    if (skewed !== null && skewed !== turn.accountId) return null;
+    skewed = turn.accountId;
+  }
+  return skewed;
+}
 
 type SqliteModule = typeof import("node:sqlite");
 let sqlite: Promise<SqliteModule | null> | null = null;
@@ -192,20 +230,20 @@ function findBinIndex(bins: readonly BinWindow[], at: number): number {
   return -1;
 }
 
-/** Reads the first 4 KB of a conversation's transcript to detect whether it was started as a subagent. */
-async function detectSubagent(conversationId: string): Promise<boolean> {
+/** Reads the first 4 KB of a conversation's transcript to find its parent conversation id when it is a subagent. */
+async function detectParentConversation(conversationId: string): Promise<string | null> {
   const file = path.join(REAL_CLI_DIR, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
   const handle = await fs.open(file, "r").catch(() => null);
-  if (!handle) return false;
+  if (!handle) return null;
   try {
     const buffer = Buffer.alloc(4096);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead <= 0) return false;
+    if (bytesRead <= 0) return null;
     const head = buffer.subarray(0, bytesRead).toString("utf8");
     const firstLine = head.split("\n", 1)[0] ?? "";
-    return SUBAGENT_MARKER.test(firstLine);
+    return SUBAGENT_MARKER.exec(firstLine)?.[1] ?? null;
   } catch {
-    return false;
+    return null;
   } finally {
     await handle.close().catch(() => undefined);
   }
@@ -220,68 +258,113 @@ export interface StatsFilter {
 
 export class UsageStatsReader {
   private readonly files = new Map<string, FileCache>();
-  private readonly subagentFlags = new Map<string, boolean>();
-  private readonly conversationAccounts = new Map<string, string>();
+  private readonly parentConversations = new Map<string, string | null>();
+  private readonly turnAccounts = new Map<string, TurnAccount[]>();
+  private readonly liveTurns = new Map<string, { conversationId: string; accountId: string; startedAt: number }>();
   private running: Promise<CallRecord[]> | null = null;
   private loadedAttribution: Promise<void> | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
   private saveSeq = 0;
+  private closing = false;
   private writing: Promise<void> = Promise.resolve();
 
   private loadAttribution(): Promise<void> {
     this.loadedAttribution ??= (async () => {
       try {
         const raw = JSON.parse(await fs.readFile(attributionFile(), "utf8")) as Record<string, unknown>;
-        for (const [conversationId, accountId] of Object.entries(raw)) {
-          if (typeof accountId === "string" && accountId) this.conversationAccounts.set(conversationId, accountId);
+        const cutoff = Date.now() - DAILY_HISTORY_DAYS * 86_400_000;
+        for (const [conversationId, value] of Object.entries(raw)) {
+          if (!Array.isArray(value)) continue;
+          const turns = value.filter(isTurnAccount).filter((turn) => turn.endedAt >= cutoff);
+          if (turns.length) this.turnAccounts.set(conversationId, turns.sort((a, b) => a.startedAt - b.startedAt));
         }
       } catch {
-        // No attribution file yet.
+        // No usable per-turn attribution yet. The legacy per-conversation file is kept separately.
       }
     })();
     return this.loadedAttribution;
   }
 
-  /** Associates a conversation id with the account that ran it, for per-account usage breakdowns. */
-  recordConversationAccount(conversationId: string, accountId: string): void {
-    void this.loadAttribution().then(() => {
-      if (this.conversationAccounts.get(conversationId) === accountId) return;
-      this.conversationAccounts.set(conversationId, accountId);
-      // Keep the map bounded to the most recent 2000 conversations.
-      if (this.conversationAccounts.size > 2000) {
-        const oldest = this.conversationAccounts.keys().next().value;
-        if (oldest) this.conversationAccounts.delete(oldest);
+  /** Tracks an in-progress turn in memory so live usage attributes to its account immediately. */
+  beginConversationTurn(agentId: string, conversationId: string, accountId: string, startedAt: number): void {
+    if (this.closing || !accountIdSchema.safeParse(accountId).success) return;
+    if (!Number.isFinite(startedAt) || startedAt <= 0) return;
+    this.liveTurns.set(agentId, { conversationId, accountId, startedAt });
+  }
+
+  endConversationTurn(agentId: string): void {
+    this.liveTurns.delete(agentId);
+  }
+
+  /** Record the observed time bounds instead of assigning a conversation's history to its last account. */
+  async recordConversationTurn(conversationId: string, accountId: string, startedAt: number, endedAt: number): Promise<void> {
+    const turn = { accountId, startedAt, endedAt };
+    if (!isTurnAccount(turn)) return;
+    await this.loadAttribution();
+    if (this.closing) return;
+    const turns = this.turnAccounts.get(conversationId) ?? [];
+    const cutoff = Date.now() - DAILY_HISTORY_DAYS * 86_400_000;
+    const current = turns.filter((entry) => entry.endedAt >= cutoff);
+    if (!current.some((entry) => entry.startedAt === startedAt && entry.endedAt === endedAt && entry.accountId === accountId)) {
+      current.push(turn);
+      current.sort((a, b) => a.startedAt - b.startedAt);
+    }
+    this.turnAccounts.set(conversationId, current);
+    if (!this.saveTimer) this.saveTimer = setTimeout(() => this.saveAttribution(), 2000);
+  }
+
+  private saveAttribution(): void {
+    clearTimeout(this.saveTimer ?? undefined);
+    this.saveTimer = null;
+    const body = JSON.stringify(Object.fromEntries(this.turnAccounts));
+    const file = attributionFile();
+    const temp = `${file}.${process.pid}.${Date.now()}.${++this.saveSeq}.tmp`;
+    this.writing = this.writing
+      .then(async () => {
+        await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+        await fs.writeFile(temp, body, { mode: 0o600 });
+        await fs.rename(temp, file);
+      })
+      .catch(async (error: unknown) => {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        console.error("antigravity-accounts: could not save conversation attribution", error);
+      });
+  }
+
+  private async parentOf(conversationId: string): Promise<string | null> {
+    if (this.parentConversations.has(conversationId)) {
+      return this.parentConversations.get(conversationId) ?? null;
+    }
+    const parent = await detectParentConversation(conversationId);
+    this.parentConversations.set(conversationId, parent);
+    return parent;
+  }
+
+  private combinedTurns(conversationId: string, now: number): TurnAccount[] {
+    const persisted = this.turnAccounts.get(conversationId) ?? [];
+    const active: TurnAccount[] = [];
+    for (const live of this.liveTurns.values()) {
+      if (live.conversationId === conversationId) {
+        active.push({ accountId: live.accountId, startedAt: live.startedAt, endedAt: Math.max(live.startedAt, now + 60_000) });
       }
-      this.scheduleSaveAttribution();
-    });
+    }
+    if (!active.length) return persisted;
+    return [...persisted, ...active].sort((a, b) => a.startedAt - b.startedAt);
   }
 
-  private scheduleSaveAttribution(): void {
-    if (this.saveTimer) return;
-    this.saveTimer = setTimeout(() => {
-      this.saveTimer = null;
-      const body = JSON.stringify(Object.fromEntries(this.conversationAccounts));
-      const file = attributionFile();
-      const temp = `${file}.${process.pid}.${Date.now()}.${++this.saveSeq}.tmp`;
-      this.writing = this.writing
-        .then(async () => {
-          await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-          await fs.writeFile(temp, body, { mode: 0o600 });
-          await fs.rename(temp, file);
-        })
-        .catch(async (error: unknown) => {
-          await fs.rm(temp, { force: true }).catch(() => undefined);
-          console.error("antigravity-accounts: could not save conversation attribution", error);
-        });
-    }, 2000);
-  }
-
-  private async isSubagent(conversationId: string): Promise<boolean> {
-    const cached = this.subagentFlags.get(conversationId);
-    if (cached !== undefined) return cached;
-    const detected = await detectSubagent(conversationId);
-    this.subagentFlags.set(conversationId, detected);
-    return detected;
+  /** Finds observed turn bounds for a conversation, walking up subagent senders to the root conversation. */
+  private async turnsForConversation(conversationId: string, now = Date.now()): Promise<readonly TurnAccount[]> {
+    const own = this.combinedTurns(conversationId, now);
+    if (own.length) return own;
+    const visited = new Set<string>([conversationId]);
+    let current = await this.parentOf(conversationId);
+    for (let depth = 0; depth < 5 && current && !visited.has(current); depth += 1) {
+      visited.add(current);
+      const turns = this.combinedTurns(current, now);
+      if (turns.length) return turns;
+      current = await this.parentOf(current);
+    }
+    return [];
   }
 
   private async readFile(
@@ -368,20 +451,37 @@ export class UsageStatsReader {
         cache = (await this.readFile(file, conversationId, signature, stat.birthtimeMs || stat.mtimeMs)) ?? undefined;
       }
       if (!cache) continue;
-      const isSubagent = await this.isSubagent(conversationId);
-      const accountId = this.conversationAccounts.get(conversationId) ?? null;
-      // A call whose step is missing takes the time of the call before it.
+      const parentId = await this.parentOf(conversationId);
+      const isSubagent = parentId !== null;
+      const turns = await this.turnsForConversation(conversationId);
+      // Earliest step timestamp for a subagent (when its parent spawned it), used when an async
+      // subagent call finishes after its parent's turn ended while still running in the same process.
+      let subagentSpawnAt: number | undefined;
+      if (isSubagent && cache.started.size > 0) {
+        let earliest = Infinity;
+        for (const ts of cache.started.values()) {
+          if (ts < earliest) earliest = ts;
+        }
+        if (Number.isFinite(earliest)) subagentSpawnAt = earliest;
+      }
+      // Estimate a missing timestamp for overall totals only. Account attribution requires an actual timestamp.
       let last = cache.fallback;
       for (const generation of cache.generations) {
-        const at = (generation.responseId && cache.started.get(generation.responseId)) || last;
+        const startedAt = generation.responseId ? cache.started.get(generation.responseId) : undefined;
+        const at = startedAt ?? last;
         last = at;
+        const accountId =
+          startedAt === undefined
+            ? null
+            : (accountForGeneration(turns, startedAt) ??
+              (isSubagent && subagentSpawnAt !== undefined ? accountForGeneration(turns, subagentSpawnAt) : null));
         records.push({ ...generation, at, conversationId, isSubagent, accountId });
       }
     }
     for (const file of this.files.keys()) {
       if (!seen.has(file)) {
         const removed = this.files.get(file);
-        if (removed) this.subagentFlags.delete(removed.conversationId);
+        if (removed) this.parentConversations.delete(removed.conversationId);
         this.files.delete(file);
       }
     }
@@ -435,17 +535,22 @@ export class UsageStatsReader {
       const cost = rates ? estimateRequestCost(record, rates) : null;
 
       // Track per-account totals across the time range (before account/model filters so selectors stay complete).
-      if (record.accountId && (scope === "all" || (scope === "subagent") === record.isSubagent)) {
-        let entry = accounts.get(record.accountId);
+      if (scope === "all" || (scope === "subagent") === record.isSubagent) {
+        const bucketId = record.accountId ?? UNATTRIBUTED_ACCOUNT_ID;
+        let entry = accounts.get(bucketId);
         if (!entry) {
           entry = { totals: emptyTotals(), conversations: new Set() };
-          accounts.set(record.accountId, entry);
+          accounts.set(bucketId, entry);
         }
         add(entry.totals, record, cost);
         entry.conversations.add(record.conversationId);
       }
 
-      if (accountId && record.accountId !== accountId) continue;
+      if (accountId) {
+        const matchesAccount =
+          accountId === UNATTRIBUTED_ACCOUNT_ID ? record.accountId === null : record.accountId === accountId;
+        if (!matchesAccount) continue;
+      }
 
       // Track main vs subagent split within the selected range & account.
       add(record.isSubagent ? breakdown.subagent : breakdown.main, record, cost);
@@ -482,11 +587,15 @@ export class UsageStatsReader {
       accounts: [...accounts.entries()]
         .map(([id, value]) => ({
           accountId: id,
-          label: labelOf(id),
+          label: id === UNATTRIBUTED_ACCOUNT_ID ? UNATTRIBUTED_ACCOUNT_ID : labelOf(id),
           conversations: value.conversations.size,
           ...value.totals,
         }))
-        .sort((left, right) => right.requests - left.requests),
+        .sort((left, right) => {
+          if (left.accountId === UNATTRIBUTED_ACCOUNT_ID) return 1;
+          if (right.accountId === UNATTRIBUTED_ACCOUNT_ID) return -1;
+          return right.requests - left.requests;
+        }),
       conversations: conversationSet.size,
       hasCustomPricing: Object.keys(customPricing).length > 0,
       generatedAt: new Date(now).toISOString(),
@@ -513,7 +622,11 @@ export class UsageStatsReader {
 
     for (const record of await this.records()) {
       if (record.at < firstStart || record.at > lastEnd) continue;
-      if (accountId && record.accountId !== accountId) continue;
+      if (accountId) {
+        const matchesAccount =
+          accountId === UNATTRIBUTED_ACCOUNT_ID ? record.accountId === null : record.accountId === accountId;
+        if (!matchesAccount) continue;
+      }
       if (scope === "main" && record.isSubagent) continue;
       if (scope === "subagent" && !record.isSubagent) continue;
       if (model && record.label !== model) continue;
@@ -538,7 +651,25 @@ export class UsageStatsReader {
     };
   }
 
-  dispose(): void {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
+  async dispose(): Promise<void> {
+    this.closing = true;
+    const now = Date.now();
+    let flushedLive = false;
+    if (this.liveTurns.size > 0) {
+      await this.loadAttribution();
+      const cutoff = now - DAILY_HISTORY_DAYS * 86_400_000;
+      for (const live of this.liveTurns.values()) {
+        const turn = { accountId: live.accountId, startedAt: live.startedAt, endedAt: Math.max(live.startedAt, now) };
+        if (!isTurnAccount(turn)) continue;
+        const current = (this.turnAccounts.get(live.conversationId) ?? []).filter((entry) => entry.endedAt >= cutoff);
+        current.push(turn);
+        current.sort((a, b) => a.startedAt - b.startedAt);
+        this.turnAccounts.set(live.conversationId, current);
+        flushedLive = true;
+      }
+      this.liveTurns.clear();
+    }
+    if (this.saveTimer || flushedLive) this.saveAttribution();
+    await this.writing;
   }
 }

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { modelRatesSchema, type PricingModelRow, type PricingState } from "../shared/contracts";
-import { DEFAULT_PRICING, defaultPricingEntry, officialRatesAt, type ModelRates } from "../shared/pricing";
+import { DEFAULT_PRICING, defaultPricingEntry, officialRatesAt, resolvePricingKey, type ModelRates } from "../shared/pricing";
 import { dataDir } from "./paths";
 
 const pricingFile = () => path.join(dataDir(), "pricing.json");
@@ -65,12 +65,15 @@ export class PricingStore {
       await this.persist({});
       return;
     }
-    const normalized = input.key?.trim().toLowerCase();
-    if (!normalized) throw new Error("Choose a model key to update.");
+    const raw = input.key?.trim().toLowerCase();
+    if (!raw) throw new Error("Choose a model key to update.");
+    const canonical = resolvePricingKey(raw, null);
     if (input.rates === null || input.rates === undefined) {
-      delete next[normalized];
+      delete next[raw];
+      delete next[canonical];
     } else {
-      next[normalized] = modelRatesSchema.parse(input.rates);
+      if (raw !== canonical) delete next[raw];
+      next[canonical] = modelRatesSchema.parse(input.rates);
     }
     await this.persist(next);
   }
