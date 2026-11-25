@@ -1,10 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { commandEnv } from "./agy";
-import { profileHome } from "./paths";
+import { profileCliDir, profileHome } from "./paths";
 
 const URL_PATTERN = /https:\/\/accounts\.google\.com\/[^\s"'<>]+/;
 const CALLBACK_ORIGIN = "https://antigravity.google";
+const FILE_STORAGE_LOG =
+  /Using file-based token storage because (?:AGY_CLI_FORCE_FILE_TOKEN_STORAGE is set|SSH session detected)/;
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const URL_WAIT_MS = 45_000;
 const SUBMIT_WAIT_MS = 90_000;
@@ -88,6 +92,19 @@ export function normalizeSignInResponse(pending: { state: string | null }, raw: 
   return value;
 }
 
+const FILE_STORAGE_LOG_WAIT_MS = 1000;
+const FILE_STORAGE_LOG_POLL_MS = 50;
+
+async function confirmFileStorageLog(logFile: string): Promise<boolean> {
+  const deadline = Date.now() + FILE_STORAGE_LOG_WAIT_MS;
+  while (true) {
+    const startupLog = await fs.readFile(logFile, "utf8").catch(() => "");
+    if (FILE_STORAGE_LOG.test(startupLog)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, FILE_STORAGE_LOG_POLL_MS));
+  }
+}
+
 /** Runs `agy acp --login` per profile and relays the code the user pastes. */
 export class SignInManager {
   private readonly pending = new Map<string, PendingSignIn>();
@@ -96,12 +113,17 @@ export class SignInManager {
     for (const existing of this.pending.values()) {
       if (existing.accountId === accountId) this.cancel(existing.loginId);
     }
-    const child = spawn(agyPath, ["acp", "--disable-telemetry", "--login"], {
+    const loginId = randomUUID();
+    const logDir = path.join(profileCliDir(accountId), "log");
+    await fs.mkdir(logDir, { recursive: true, mode: 0o700 });
+    const logFile = path.join(logDir, `acp-login-${loginId}.log`);
+    const child = spawn(agyPath, ["acp", "--disable-telemetry", "--login", "--log-file", logFile], {
       cwd: profileHome(accountId),
       env: commandEnv(accountId),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const loginId = randomUUID();
+    // An exited or cancelled process can close its pipe while a code is being written.
+    child.stdin.on("error", () => child.kill("SIGTERM"));
     let output = "";
     const exited = new Promise<number | null>((resolve) => {
       child.on("close", (code) => resolve(code));
@@ -146,6 +168,12 @@ export class SignInManager {
         );
       });
     });
+    // agy logs its choice before requesting the code. Do not open an OAuth flow against the keyring.
+    if (!(await confirmFileStorageLog(logFile))) {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+      throw new Error("agy did not confirm file-backed sign-in. The authorization was stopped before accepting a code.");
+    }
     let state: string | null = null;
     try {
       state = new URL(url).searchParams.get("state");
@@ -196,15 +224,20 @@ export class SignInManager {
     entry.submitting = true;
     const before = entry.output.length;
     const submittedAt = Date.now() - 5000;
+    let timer: NodeJS.Timeout | undefined;
     try {
       entry.child.stdin.write(`${response}\n`);
       const code = await Promise.race([
         entry.exited,
-        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), SUBMIT_WAIT_MS)),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), SUBMIT_WAIT_MS);
+        }),
       ]);
       if (code === "timeout") {
         entry.child.kill("SIGTERM");
-        setTimeout(() => entry.child.kill("SIGKILL"), 2000).unref?.();
+        const kill = setTimeout(() => entry.child.kill("SIGKILL"), 2000);
+        await entry.exited;
+        clearTimeout(kill);
         return { exitedCleanly: false, submittedAt };
       }
       if (code !== 0) {
@@ -213,6 +246,7 @@ export class SignInManager {
       }
       return { exitedCleanly: true, submittedAt };
     } finally {
+      clearTimeout(timer);
       this.drop(loginId);
     }
   }

@@ -15,6 +15,7 @@ import { dataDir, displayPath, profileHome, resolveAgy } from "./paths";
 import {
   deleteSignIn,
   ensureProfile,
+  profileSignInFingerprint,
   recoverSavedFiles,
   recoveryFolder,
   removeProfile,
@@ -54,6 +55,7 @@ export interface StatusUpdateEvent {
   status: AccountSummary["status"];
   quota: QuotaGroup[] | null;
   signedInChanged: boolean;
+  emailChanged?: boolean;
 }
 
 /** Owns the account list, sign-in state, and change notifications. */
@@ -63,6 +65,7 @@ export class AccountService {
   private readonly runtime = new Map<string, RuntimeStatus>();
   private readonly probing = new Map<string, { epoch: number; task: Promise<void> }>();
   private readonly epochs = new Map<string, number>();
+  private readonly authOperations = new Map<string, Promise<unknown>>();
   private readonly listeners = new Set<(revision: number) => void>();
   private readonly statusListeners = new Set<(event: StatusUpdateEvent) => void>();
   private cooldownProvider: (accountId: string) => AccountCooldown[] = () => [];
@@ -108,25 +111,46 @@ export class AccountService {
     return accountId === SYSTEM_ACCOUNT_ID || Boolean(this.store.get(accountId));
   }
 
+  /** Serialize authorization and removal, including authorizations opened by another client. */
+  private changeProfileAuth<T>(accountId: string, change: () => Promise<T>): Promise<T> {
+    const previous = this.authOperations.get(accountId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      // A quota probe can refresh a token on disk. Finish any existing probe before changing it.
+      await this.probing.get(accountId)?.task;
+      return change();
+    });
+    this.authOperations.set(accountId, operation);
+    return operation.finally(() => {
+      if (this.authOperations.get(accountId) === operation) this.authOperations.delete(accountId);
+    });
+  }
+
   private saveStatuses(): void {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
-      this.saveTimer = null;
-      const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
-      const file = statusFile();
-      const seq = ++this.statusWriteSeq;
-      const temp = `${file}.${process.pid}.${Date.now()}.${seq}.tmp`;
-      this.statusWriting = this.statusWriting
-        .then(async () => {
-          await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-          await fs.writeFile(temp, body, { mode: 0o600 });
-          await fs.rename(temp, file);
-        })
-        .catch(async (error: unknown) => {
-          await fs.rm(temp, { force: true }).catch(() => undefined);
-          console.error("antigravity-accounts: could not save statuses", error);
-        });
+      this.flushStatuses();
     }, 1000);
+  }
+
+  private flushStatuses(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
+    const file = statusFile();
+    const seq = ++this.statusWriteSeq;
+    const temp = `${file}.${process.pid}.${Date.now()}.${seq}.tmp`;
+    this.statusWriting = this.statusWriting
+      .then(async () => {
+        await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+        await fs.writeFile(temp, body, { mode: 0o600 });
+        await fs.rename(temp, file);
+      })
+      .catch(async (error: unknown) => {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        console.error("antigravity-accounts: could not save statuses", error);
+      });
   }
 
   setCooldownProvider(provider: (accountId: string) => AccountCooldown[]): void {
@@ -233,9 +257,18 @@ export class AccountService {
 
   /** Re-checks sign-in and quota for one account. Concurrent calls of the same epoch share one probe. */
   refreshOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
+    const auth = this.authOperations.get(accountId);
+    return auth
+      ? auth.catch(() => undefined).then(() => this.refreshOne(accountId, options))
+      : this.probeOne(accountId, options);
+  }
+
+  private probeOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
     const epoch = this.epochOf(accountId);
     const running = this.probing.get(accountId);
-    if (running && running.epoch === epoch && !options?.forcePlan) return running.task;
+    if (running && running.epoch === epoch) {
+      return options?.forcePlan ? running.task.then(() => this.refreshOne(accountId, options)) : running.task;
+    }
     const task = (async () => {
       if (!this.exists(accountId)) return;
       const agy = await this.agy();
@@ -256,7 +289,10 @@ export class AccountService {
         if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
         await this.ensureAccountProfile(accountId);
       }
-      const result = await probeAccount(agy, accountId);
+      const result =
+        accountId !== SYSTEM_ACCOUNT_ID && !(await this.hasSignInFile(accountId))
+          ? ({ kind: "signed-out", detail: "No independent sign-in was found for this account." } as const)
+          : await probeAccount(agy, accountId);
       if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
       const email = result.kind === "signed-in" ? await readAccountEmail(accountId) : null;
       const knownEmail =
@@ -271,7 +307,7 @@ export class AccountService {
         const age = planCheckedAt ? Date.now() - Date.parse(planCheckedAt) : Infinity;
         const shouldCheckPlan =
           otherAccount ||
-          (options?.forcePlan && !plan) ||
+          Boolean(options?.forcePlan) ||
           age > (plan ? PLAN_MAX_AGE_MS : PLAN_RETRY_MS);
         if (shouldCheckPlan) {
           const read = await readPlan(agy, accountId).catch(() => null);
@@ -315,6 +351,7 @@ export class AccountService {
         status: result.kind,
         quota: nextStatus.quota,
         signedInChanged: previous.status !== result.kind,
+        emailChanged: result.kind === "signed-in" && email !== null && email !== knownEmail,
       });
     })()
       .catch((error: unknown) => {
@@ -431,15 +468,9 @@ export class AccountService {
     this.changed();
   }
 
-  /** Whether the sign-in file agy wrote for a profile account is still there (true when none was recorded). */
+  /** A profile must have its own real OAuth credential before it can be used. */
   async hasSignInFile(accountId: string): Promise<boolean> {
-    const account = this.store.get(accountId);
-    const recorded = account?.credentialFiles.find((file) => /oauth-token|token\.json|auth/i.test(file));
-    if (!recorded) return true;
-    return fs
-      .stat(path.join(profileHome(accountId), recorded))
-      .then(() => true)
-      .catch(() => false);
+    return (await profileSignInFingerprint(accountId)) !== null;
   }
 
   /** Last known quota groups, without probing. */
@@ -556,111 +587,114 @@ export class AccountService {
   }
 
   /** Removes a profile account. Returns where its saved files went, or null when it had none. */
-  async remove(accountId: string): Promise<SavedFiles | null> {
-    const account = this.requireProfileAccount(accountId);
-    this.bumpEpoch(accountId);
-    this.probing.delete(accountId);
-    this.signIns.cancelForAccount(accountId);
-    const preserved = await removeProfile(accountId, account.label);
-    await this.store.update((data) => {
-      data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
-      data.order = data.order.filter((id) => id !== accountId);
-      if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
+  remove(accountId: string): Promise<SavedFiles | null> {
+    return this.changeProfileAuth(accountId, async () => {
+      const account = this.requireProfileAccount(accountId);
+      this.bumpEpoch(accountId);
+      this.signIns.cancelForAccount(accountId);
+      const preserved = await removeProfile(accountId, account.label);
+      await this.store.update((data) => {
+        data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
+        data.order = data.order.filter((id) => id !== accountId);
+        if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
+      });
+      this.runtime.delete(accountId);
+      this.changed();
+      return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
     });
-    this.runtime.delete(accountId);
-    this.changed();
-    return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
   }
 
-  async signOut(accountId: string): Promise<void> {
-    const account = this.requireProfileAccount(accountId);
-    this.bumpEpoch(accountId);
-    this.probing.delete(accountId);
-    await deleteSignIn(accountId, account.credentialFiles);
-    await this.store.update((data) => {
-      const entry = data.accounts.find((candidate) => candidate.id === accountId);
-      if (entry) {
-        entry.credentialFiles = [];
-        entry.email = null;
-        entry.unsafeDetail = null;
-      }
+  signOut(accountId: string): Promise<void> {
+    return this.changeProfileAuth(accountId, async () => {
+      const account = this.requireProfileAccount(accountId);
+      this.bumpEpoch(accountId);
+      this.signIns.cancelForAccount(accountId);
+      await deleteSignIn(accountId, account.credentialFiles);
+      await this.store.update((data) => {
+        const entry = data.accounts.find((candidate) => candidate.id === accountId);
+        if (entry) {
+          entry.credentialFiles = [];
+          entry.email = null;
+          entry.unsafeDetail = null;
+        }
+      });
+      this.runtime.set(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
+      this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true });
+      this.changed();
     });
-    this.runtime.set(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
-    this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true });
-    this.changed();
-    await this.refreshOne(accountId);
   }
 
-  async startSignIn(accountId: string): Promise<{ loginId: string; url: string; expiresAt: string }> {
-    this.requireProfileAccount(accountId);
-    const agy = await this.requireAgy();
-    await this.ensureAccountProfile(accountId);
-    return this.signIns.start(agy, accountId);
+  startSignIn(accountId: string): Promise<{ loginId: string; url: string; expiresAt: string }> {
+    return this.changeProfileAuth(accountId, async () => {
+      this.requireProfileAccount(accountId);
+      const agy = await this.requireAgy();
+      await this.ensureAccountProfile(accountId);
+      return this.signIns.start(agy, accountId);
+    });
   }
 
-  /** Completes a sign-in, verifies it, and checks that it stayed inside the profile. */
+  /** Completes a sign-in only after agy has written a new independent credential. */
   async submitSignIn(loginId: string, code: string): Promise<void> {
     const accountId = this.signIns.accountOf(loginId);
     if (!accountId) throw new Error("This sign-in expired or was cancelled. Start again.");
-    const systemEmailBefore = this.store.snapshot().systemEmail;
-    const outcome = await this.signIns.submit(loginId, code);
-    const scan = await scanAfterSignIn(accountId, outcome.submittedAt);
-    this.bumpEpoch(accountId);
-    this.probing.delete(accountId);
-    await this.refreshOne(accountId, { forcePlan: true });
-    const status = this.runtime.get(accountId);
-    let unsafeDetail: string | null = null;
-    if (scan.leaked.length > 0) {
-      unsafeDetail =
-        `agy stored this sign-in outside the account's profile (${scan.leaked.join(", ")}). ` +
-        "The plugin will not launch this account so it cannot overwrite the system sign-in.";
-      console.error(`antigravity-accounts: sign-in for ${accountId} wrote ${scan.leaked.join(", ")}`);
-    }
-    await this.store.update((data) => {
-      const entry = data.accounts.find((candidate) => candidate.id === accountId);
-      if (!entry) return;
-      if (scan.own.length > 0) entry.credentialFiles = scan.own;
-      entry.unsafeDetail = unsafeDetail;
-    });
-    // A sign-in that changed the system account's identity means the keyring was written.
-    if (status?.status === "signed-in" && systemEmailBefore) {
-      await this.refreshOne(SYSTEM_ACCOUNT_ID);
-      const systemEmailAfter = this.store.snapshot().systemEmail;
-      const accountEmail = this.store.get(accountId)?.email ?? null;
-      if (
-        accountEmail &&
-        systemEmailAfter &&
-        systemEmailAfter !== systemEmailBefore &&
-        systemEmailAfter === accountEmail
-      ) {
-        await this.store.update((data) => {
-          const entry = data.accounts.find((candidate) => candidate.id === accountId);
-          if (entry) {
-            entry.unsafeDetail =
-              "This sign-in replaced the system sign-in as well. Sign in to the system account again with agy, then remove this account.";
-          }
-        });
+    return this.changeProfileAuth(accountId, async () => {
+      this.requireProfileAccount(accountId);
+      const systemEmailBefore = this.store.snapshot().systemEmail;
+      const tokenBefore = await profileSignInFingerprint(accountId);
+      const outcome = await this.signIns.submit(loginId, code);
+      const tokenAfter = await profileSignInFingerprint(accountId);
+      const scan = await scanAfterSignIn(accountId, outcome.submittedAt);
+      this.bumpEpoch(accountId);
+
+      let unsafeDetail: string | null = null;
+      if (scan.leaked.length > 0) {
+        unsafeDetail = "agy wrote sign-in data outside the account’s profile. Check the system sign-in before trying again.";
+        console.error(`antigravity-accounts: sign-in for ${accountId} wrote ${scan.leaked.join(", ")}`);
+      } else if (!tokenAfter || tokenAfter === tokenBefore) {
+        unsafeDetail = "agy did not write a new independent credential. The account cannot be used.";
+      } else {
+        await this.probeOne(accountId, { forcePlan: true });
       }
-    }
-    this.changed();
-    if (status?.status !== "signed-in") {
-      const detail = status?.statusDetail ?? "agy did not confirm the sign-in";
-      throw new Error(
-        outcome.exitedCleanly
-          ? `agy accepted the code but the account still is not signed in: ${detail}`
-          : `agy did not finish the sign-in: ${detail}`,
-      );
-    }
+
+      const status = this.runtime.get(accountId);
+      if (systemEmailBefore) {
+        await this.refreshOne(SYSTEM_ACCOUNT_ID);
+        const systemEmailAfter = this.store.snapshot().systemEmail;
+        if (systemEmailAfter && systemEmailAfter !== systemEmailBefore) {
+          unsafeDetail = "The system sign-in changed while this account was signing in. Check the system sign-in before trying again.";
+        }
+      }
+      await this.store.update((data) => {
+        const entry = data.accounts.find((candidate) => candidate.id === accountId);
+        if (!entry) return;
+        if (scan.own.length > 0) entry.credentialFiles = scan.own;
+        entry.unsafeDetail = unsafeDetail;
+        if (unsafeDetail && data.defaultAccountId === accountId) {
+          data.defaultAccountId = SYSTEM_ACCOUNT_ID;
+        }
+      });
+      this.changed();
+      if (unsafeDetail) throw new Error(unsafeDetail);
+      if (status?.status !== "signed-in") {
+        const detail = status?.statusDetail ?? "agy did not confirm the sign-in";
+        throw new Error(
+          outcome.exitedCleanly
+            ? `agy accepted the code but the account still is not signed in: ${detail}`
+            : `agy did not finish the sign-in: ${detail}`,
+        );
+      }
+    });
   }
 
   cancelSignIn(loginId: string): void {
     this.signIns.cancel(loginId);
   }
 
-  dispose(): void {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
+  async dispose(): Promise<void> {
+    if (this.saveTimer) this.flushStatuses();
     this.signIns.cancelAll();
     this.listeners.clear();
     this.statusListeners.clear();
+    await this.statusWriting;
   }
 }

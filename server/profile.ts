@@ -215,6 +215,15 @@ async function profileEntry(accountId: string, target: string): Promise<Stats | 
   return stat;
 }
 
+const OAUTH_TOKEN_FILE = "antigravity-oauth-token";
+
+/** A fingerprint of agy's actual file-backed login, never its contents or a cache sidecar. */
+export async function profileSignInFingerprint(accountId: string): Promise<string | null> {
+  const token = await profileEntry(accountId, path.join(profileCliDir(accountId), OAUTH_TOKEN_FILE));
+  if (!token?.isFile() || token.size === 0) return null;
+  return `${token.dev}:${token.ino}:${token.size}:${token.mtimeMs}:${token.ctimeMs}`;
+}
+
 /** Entries of a real folder in the profile. Never reads through a link, into the real home or elsewhere. */
 async function realEntries(accountId: string, dir: string): Promise<Dirent[]> {
   return (await profileEntry(accountId, dir))?.isDirectory() ? readDirSafe(dir) : [];
@@ -529,7 +538,8 @@ export async function scanAfterSignIn(accountId: string, since: number): Promise
   for (const entry of await readDirSafe(REAL_GEMINI)) {
     const full = path.join(REAL_GEMINI, entry.name);
     if (entry.name === "antigravity-cli") {
-      // The system sign-in's own folder: only its top-level files and the shared conversation dirs.
+      // The system sign-in's own folder: check top-level files and cache, never shared agent artifacts
+      // in brain/conversations/implicit (where running agents legitimately write files named e.g. auth.md).
       for (const file of await readDirSafe(full)) {
         const filePath = path.join(full, file.name);
         if (file.isFile() && CREDENTIAL_NAME.test(file.name)) {
@@ -537,13 +547,13 @@ export async function scanAfterSignIn(accountId: string, since: number): Promise
           if (stat && stat.mtimeMs >= since) leaked.push(filePath);
         }
       }
-      for (const shared of SHARED_CLI_DIRS) {
-        leaked.push(...(await scanCredentialFiles(path.join(full, shared), { since, maxDepth: 2 })));
-      }
+      leaked.push(...(await scanCredentialFiles(path.join(full, "cache"), { since, maxDepth: 2 })));
       continue;
     }
+    // Skip user skill/plugin configs and sandbox scratch dirs so unrelated edits never trip leak detection.
+    if (entry.name === "config" || entry.name === "sandbox") continue;
     if (entry.isDirectory()) {
-      leaked.push(...(await scanCredentialFiles(full, { since, maxDepth: 4 })));
+      leaked.push(...(await scanCredentialFiles(full, { since, maxDepth: 3 })));
     } else if (entry.isFile() && CREDENTIAL_NAME.test(entry.name)) {
       const stat = await fs.stat(full).catch(() => null);
       if (stat && stat.mtimeMs >= since) leaked.push(full);
@@ -569,6 +579,8 @@ export function deleteSignIn(accountId: string, recorded: readonly string[]): Pr
     if (targets.size === 0) {
       for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 2 })) targets.add(file);
     }
+    // The old index can contain only a cache entry, or omit a token agy wrote later.
+    targets.add(path.join(cli, OAUTH_TOKEN_FILE));
     const removed: string[] = [];
     for (const file of targets) {
       // lstat: a link is not a file here.

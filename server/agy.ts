@@ -6,12 +6,12 @@ import { z } from "zod";
 import { SYSTEM_ACCOUNT_ID, type QuotaGroup } from "../shared/contracts";
 import { REAL_CLI_DIR, profileCliDir, profileHome } from "./paths";
 
-/** agy 1.5 keeps Google sign-ins in one OS keyring entry unless it believes it runs over SSH. */
+/** Older agy builds select file-backed sign-in in an SSH session. */
 export const FAKE_SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 0";
 
 /**
- * Environment added to an agent session on a profile account. HOME moves agy's data directory and
- * hides the keyring sign-in; SSH_CONNECTION makes agy store its own sign-in in a file inside HOME.
+ * Profile accounts use their own data directory and explicitly select file-backed sign-in.
+ * SSH_CONNECTION also supports older agy builds that select file storage in SSH sessions.
  * ANTIGRAVITY_HOME is ignored by agy, but Paseo's built-in usage source reads it to show the quota
  * of the account the agent runs on.
  */
@@ -20,6 +20,7 @@ export function sessionEnv(accountId: string, current: Readonly<Record<string, s
   return {
     HOME: profileHome(accountId),
     SSH_CONNECTION: current.SSH_CONNECTION || FAKE_SSH_CONNECTION,
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "1",
     ANTIGRAVITY_HOME: profileCliDir(accountId),
   };
 }
@@ -298,6 +299,24 @@ export function readPlan(agyPath: string, accountId: string): Promise<AccountPla
 }
 
 const EMAIL_LINE = /authenticated successfully as (\S+@\S+)/g;
+const LOG_CHUNK_BYTES = 64 * 1024;
+
+/** Reads small logs in full, or the head and tail of large logs so memory stays bounded. */
+async function readLogSample(filePath: string, size: number): Promise<string> {
+  if (size <= LOG_CHUNK_BYTES * 2) return fs.readFile(filePath, "utf8");
+  const handle = await fs.open(filePath, "r");
+  try {
+    const head = Buffer.alloc(LOG_CHUNK_BYTES);
+    const tail = Buffer.alloc(LOG_CHUNK_BYTES);
+    const [headRead, tailRead] = await Promise.all([
+      handle.read(head, 0, LOG_CHUNK_BYTES, 0),
+      handle.read(tail, 0, LOG_CHUNK_BYTES, Math.max(0, size - LOG_CHUNK_BYTES)),
+    ]);
+    return `${head.toString("utf8", 0, headRead.bytesRead)}\n${tail.toString("utf8", 0, tailRead.bytesRead)}`;
+  } finally {
+    await handle.close();
+  }
+}
 
 /** The Google account agy last reported for this account, from its own logs. */
 export async function readAccountEmail(accountId: string): Promise<string | null> {
@@ -317,15 +336,15 @@ export async function readAccountEmail(accountId: string): Promise<string | null
       .map(async (name) => {
         const full = path.join(logDir, name);
         const stat = await fs.stat(full).catch(() => null);
-        return stat?.isFile() ? { full, mtime: stat.mtimeMs } : null;
+        return stat?.isFile() ? { full, mtime: stat.mtimeMs, size: stat.size } : null;
       }),
   );
   const recent = files
-    .filter((file): file is { full: string; mtime: number } => file !== null)
+    .filter((file): file is { full: string; mtime: number; size: number } => file !== null)
     .sort((left, right) => right.mtime - left.mtime)
     .slice(0, 25);
   for (const file of recent) {
-    const text = await fs.readFile(file.full, "utf8").catch(() => "");
+    const text = await readLogSample(file.full, file.size).catch(() => "");
     let last: string | null = null;
     for (const match of text.matchAll(EMAIL_LINE)) last = match[1] ?? null;
     if (last) return last.replace(/[.,;)]+$/, "");
