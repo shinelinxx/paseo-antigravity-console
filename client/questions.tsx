@@ -798,7 +798,7 @@ function LiveQuestionResolver({
   );
 }
 
-export const AskQuestionRow = memo(function AskQuestionRow({
+const AskQuestionRowInner = memo(function AskQuestionRowInner({
   agentId,
   item,
   theme,
@@ -846,3 +846,7 @@ export const AskQuestionRow = memo(function AskQuestionRow({
     />
   );
 });
+
+export function AskQuestionRow(props: PluginTimelineItemProps<AskQuestionCard>) {
+  return <AskQuestionRowInner {...props} />;
+}
