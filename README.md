@@ -1,5 +1,7 @@
 # Antigravity Console for Paseo
 
+English | [简体中文](README.zh-CN.md)
+
 Multi-account management, model-aware automatic fallback, quota and API cost analytics, subagent inspection, interactive question cards, and Orchestrator model control for [Paseo](https://paseo.sh)'s built-in Antigravity provider.
 
 Works across Paseo desktop, web, and mobile (iOS & Android), with English and Simplified Chinese (`zh-CN`) localization.
