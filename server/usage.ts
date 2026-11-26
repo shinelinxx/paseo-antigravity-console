@@ -9,13 +9,14 @@ import {
 import { z } from "zod";
 import { SYSTEM_ACCOUNT_ID, accountIdSchema, type QuotaGroup } from "../shared/contracts";
 import type { AccountService } from "./accounts";
-import { profileCliDir } from "./paths";
+import { REAL_CLI_DIR, profileCliDir } from "./paths";
+import { orderedAccountIds } from "./store";
 
 const input = z.object({ accountId: accountIdSchema }).strict();
 
 /** A hash of the account's antigravity-cli directory, the identity Paseo's own reader uses too. */
 function accountKey(accountId: string): string {
-  return hashAccountKey(profileCliDir(accountId));
+  return hashAccountKey(accountId === SYSTEM_ACCOUNT_ID ? REAL_CLI_DIR : profileCliDir(accountId));
 }
 
 /** Lengths of the periods agy names, so Paseo can tell whether a quota lasts until its reset. */
@@ -68,7 +69,7 @@ export function quotaWindows(groups: readonly QuotaGroup[]): UsageWindow[] {
       return [
         windowFromUsedPct({
           id: bucket.id,
-          label: `${groupLabel} · ${windowLabel}${bucket.disabled ? " · Off" : ""}`,
+          label: `${groupLabel} · ${windowLabel}`,
           shortLabel: includeGroup ? `${groupLabel} ${period}`.trim() : period,
           summary: !bucket.disabled && normalizedWindow === "weekly",
           utilizationPct: used,
@@ -82,26 +83,27 @@ export function quotaWindows(groups: readonly QuotaGroup[]): UsageWindow[] {
 }
 
 /**
- * Lists only the accounts this plugin added, on the host-wide Usage screen. Paseo's built-in
- * Antigravity source (0.17.1 and later) reports the system sign-in there, and in an agent's
- * popover the account that agent runs on: it follows the session's ANTIGRAVITY_HOME, which the
- * launch hook sets per account. Paseo keeps one card per source and account, so reporting those
- * here as well showed each of them twice.
+ * Reports all configured Antigravity accounts (including the system sign-in) on the host-wide
+ * Usage screen with consistent provider naming, account labels, and Google AI plan badges.
+ * Users can hide Paseo's built-in Antigravity card in Usage settings if they prefer only these
+ * enriched cards.
  */
 export function createUsageSource(service: AccountService): UsageSourceRegistration {
   return {
     id: "antigravity-accounts",
-    label: "Antigravity accounts",
+    label: "Antigravity",
     icon: "icon.svg",
     input,
     async discover(scope: UsageScope) {
       if (scope.kind !== "global") return [];
       await service.init();
-      return service.store.snapshot().accounts.map((account) => ({
-        key: accountKey(account.id),
-        label: account.label,
+      const snapshot = service.store.snapshot();
+      const byId = new Map(snapshot.accounts.map((account) => [account.id, account]));
+      return orderedAccountIds(snapshot).map((id) => ({
+        key: accountKey(id),
+        label: id === SYSTEM_ACCOUNT_ID ? snapshot.systemLabel : (byId.get(id)?.label ?? id),
         harness: "Antigravity",
-        input: { accountId: account.id },
+        input: { accountId: id },
       }));
     },
     async fetch(value: unknown) {
