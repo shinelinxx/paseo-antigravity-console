@@ -23,7 +23,22 @@ export const mono = Platform.select({
 /** Numbers that line up in columns. */
 export const tabular = { fontVariant: ["tabular-nums" as const] };
 
+const MAX_COLOR_CACHE = 256;
+const channelsCache = new Map<string, [number, number, number, number] | null>();
+const tintCache = new Map<string, string>();
+
+function setBounded<V>(map: Map<string, V>, key: string, value: V): void {
+  if (map.size >= MAX_COLOR_CACHE) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
 function channels(color: string): [number, number, number, number] | null {
+  const cached = channelsCache.get(color);
+  if (cached !== undefined) return cached;
+  let parsed: [number, number, number, number] | null = null;
   const value = color.trim();
   const hex = /^#([0-9a-f]{3,8})$/i.exec(value)?.[1];
   if (hex) {
@@ -34,26 +49,34 @@ function channels(color: string): [number, number, number, number] | null {
             .map((digit) => digit + digit)
             .join("")
         : hex;
-    if (full.length !== 6 && full.length !== 8) return null;
-    const alpha = full.length === 8 ? parseInt(full.slice(6, 8), 16) / 255 : 1;
-    return [parseInt(full.slice(0, 2), 16), parseInt(full.slice(2, 4), 16), parseInt(full.slice(4, 6), 16), alpha];
-  }
-  const rgb = /^rgba?\(([^)]+)\)$/i.exec(value)?.[1];
-  if (rgb) {
-    const parts = rgb.split(/[\s,/]+/).filter(Boolean).map(Number);
-    if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
-      return [parts[0]!, parts[1]!, parts[2]!, Number.isFinite(parts[3]) ? parts[3]! : 1];
+    if (full.length === 6 || full.length === 8) {
+      const alpha = full.length === 8 ? parseInt(full.slice(6, 8), 16) / 255 : 1;
+      parsed = [parseInt(full.slice(0, 2), 16), parseInt(full.slice(2, 4), 16), parseInt(full.slice(4, 6), 16), alpha];
+    }
+  } else {
+    const rgb = /^rgba?\(([^)]+)\)$/i.exec(value)?.[1];
+    if (rgb) {
+      const parts = rgb.split(/[\s,/]+/).filter(Boolean).map(Number);
+      if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
+        parsed = [parts[0]!, parts[1]!, parts[2]!, Number.isFinite(parts[3]) ? parts[3]! : 1];
+      }
     }
   }
-  return null;
+  setBounded(channelsCache, color, parsed);
+  return parsed;
 }
 
 /** A theme color at the given opacity, for tinted backgrounds that work in light and dark themes. */
 export function tint(color: string, alpha: number): string {
+  const key = `${color}\0${alpha}`;
+  const cached = tintCache.get(key);
+  if (cached !== undefined) return cached;
   const parsed = channels(color);
-  if (!parsed) return color;
-  const [red, green, blue, base] = parsed;
-  return `rgba(${red}, ${green}, ${blue}, ${Math.max(0, Math.min(1, base * alpha))})`;
+  const result = parsed
+    ? `rgba(${parsed[0]}, ${parsed[1]}, ${parsed[2]}, ${Math.max(0, Math.min(1, parsed[3] * alpha))})`
+    : color;
+  setBounded(tintCache, key, result);
+  return result;
 }
 
 export type Tone = "neutral" | "accent" | "success" | "warning" | "danger";

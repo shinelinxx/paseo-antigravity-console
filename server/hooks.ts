@@ -280,6 +280,16 @@ export function registerHooks(
 ): Array<() => void> {
   const removers: Array<() => void> = [];
   const activeTurns = new Map<string, { turnId: string | null; accountId: string; startedAt: number }>();
+  const agentConversations = new Map<string, string>();
+
+  async function resolveConversationId(paseo: PaseoApi, agentId: string): Promise<string | null> {
+    const cached = agentConversations.get(agentId);
+    if (cached) return cached;
+    const snapshot = await paseo.agents.ref(agentId).refresh().catch(() => null);
+    const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+    if (conversationId) agentConversations.set(agentId, conversationId);
+    return conversationId;
+  }
 
   // New Antigravity agents get the default account (or best fallback when configured & default is unavailable).
   removers.push(
@@ -326,6 +336,7 @@ export function registerHooks(
       if (!isAntigravityProvider(request.provider)) return undefined;
       await service.init();
       let accountId = accountIdFromMetadata(request.metadata);
+      let verifiedSignInFile = false;
       // Fallback: an account known to be unable to serve gives way to the next one that can,
       // unless the user or fallback controller explicitly selected this account right now.
       if (service.fallbackSettings().enabled && fallback && !pending.isSkippingRedirect(request.agentId)) {
@@ -344,7 +355,12 @@ export function registerHooks(
             request.purpose === "interactive",
             model,
           );
-          if (next) accountId = next;
+          if (next) {
+            accountId = next;
+            verifiedSignInFile = true;
+          }
+        } else {
+          verifiedSignInFile = true;
         }
       }
       const account = accountId === SYSTEM_ACCOUNT_ID ? null : service.store.get(accountId);
@@ -352,7 +368,9 @@ export function registerHooks(
         const problem = !account
           ? "The Antigravity account this agent was using has been removed."
           : account.unsafeDetail ??
-            (!(await service.hasSignInFile(accountId)) ? "This Antigravity account has no independent sign-in." : null);
+            (!verifiedSignInFile && !(await service.hasSignInFile(accountId))
+              ? "This Antigravity account has no independent sign-in."
+              : null);
         if (problem) {
           // Reading history is harmless on the system sign-in; running a turn is not.
           if (request.purpose === "history") accountId = SYSTEM_ACCOUNT_ID;
@@ -380,8 +398,7 @@ export function registerHooks(
       const entry = { turnId, accountId, startedAt };
       activeTurns.set(agent.id, entry);
       if (observers?.onConversationTurnStart) {
-        const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
-        const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+        const conversationId = await resolveConversationId(paseo, agent.id);
         if (conversationId && activeTurns.get(agent.id) === entry) {
           observers.onConversationTurnStart(agent.id, conversationId, accountId, startedAt);
         }
@@ -413,8 +430,7 @@ export function registerHooks(
         }, 15_000),
       );
       if (turn && observers?.onConversationTurn) {
-        const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
-        const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+        const conversationId = await resolveConversationId(paseo, agent.id);
         if (conversationId) {
           await observers.onConversationTurn(conversationId, accountId, turn.startedAt, endedAt);
         }
@@ -424,6 +440,7 @@ export function registerHooks(
   removers.push(() => {
     for (const timer of quotaRefresh.values()) clearTimeout(timer);
     quotaRefresh.clear();
+    agentConversations.clear();
   });
 
   // Deferred switches run as soon as the agent's turn ends.
@@ -456,13 +473,13 @@ export function registerHooks(
         activeTurns.delete(agent.id);
         observers?.onConversationTurnEnd?.(agent.id);
         if (observers?.onConversationTurn) {
-          const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
-          const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+          const conversationId = await resolveConversationId(paseo, agent.id);
           if (conversationId) {
             await observers.onConversationTurn(conversationId, active.accountId, active.startedAt, endedAt);
           }
         }
       }
+      agentConversations.delete(agent.id);
     }),
   );
 
@@ -471,6 +488,7 @@ export function registerHooks(
       pending.delete(agent.id);
       pending.clearSessionAccount(agent.id);
       activeTurns.delete(agent.id);
+      agentConversations.delete(agent.id);
       observers?.onConversationTurnEnd?.(agent.id);
       observers?.onAgentArchived?.(agent.id);
     }),

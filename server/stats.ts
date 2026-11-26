@@ -52,7 +52,29 @@ interface FileCache {
   lastGenIndex: number;
   generations: Generation[];
   started: Map<string, number>;
+  subagentSpawnAt: number | undefined;
   fallback: number;
+}
+
+const COLLECT_CACHE_TTL_MS = 5000;
+const STAT_CONCURRENCY = 16;
+
+async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 interface BinWindow {
@@ -262,11 +284,18 @@ export class UsageStatsReader {
   private readonly turnAccounts = new Map<string, TurnAccount[]>();
   private readonly liveTurns = new Map<string, { conversationId: string; accountId: string; startedAt: number }>();
   private running: Promise<CallRecord[]> | null = null;
+  private cachedRecords: { at: number; records: CallRecord[] } | null = null;
+  private cacheVersion = 0;
   private loadedAttribution: Promise<void> | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
   private saveSeq = 0;
   private closing = false;
   private writing: Promise<void> = Promise.resolve();
+
+  private invalidateCache(): void {
+    this.cacheVersion += 1;
+    this.cachedRecords = null;
+  }
 
   private loadAttribution(): Promise<void> {
     this.loadedAttribution ??= (async () => {
@@ -290,10 +319,13 @@ export class UsageStatsReader {
     if (this.closing || !accountIdSchema.safeParse(accountId).success) return;
     if (!Number.isFinite(startedAt) || startedAt <= 0) return;
     this.liveTurns.set(agentId, { conversationId, accountId, startedAt });
+    this.invalidateCache();
   }
 
   endConversationTurn(agentId: string): void {
-    this.liveTurns.delete(agentId);
+    if (this.liveTurns.delete(agentId)) {
+      this.invalidateCache();
+    }
   }
 
   /** Record the observed time bounds instead of assigning a conversation's history to its last account. */
@@ -310,6 +342,7 @@ export class UsageStatsReader {
       current.sort((a, b) => a.startedAt - b.startedAt);
     }
     this.turnAccounts.set(conversationId, current);
+    this.invalidateCache();
     if (!this.saveTimer) this.saveTimer = setTimeout(() => this.saveAttribution(), 2000);
   }
 
@@ -381,7 +414,7 @@ export class UsageStatsReader {
     let nextLastGenIndex = previous ? previous.lastGenIndex : -1;
     let db: InstanceType<SqliteModule["DatabaseSync"]> | null = null;
     try {
-      db = new module.DatabaseSync(file, { timeout: 1000 });
+      db = new module.DatabaseSync(file, { timeout: 200 });
       db.exec("PRAGMA query_only = ON");
       // Generation records are written once per call, so only new rows need reading.
       const rows = db
@@ -393,17 +426,26 @@ export class UsageStatsReader {
         const generation = parseGeneration(new Uint8Array(row.data));
         if (generation) nextGenerations.push(generation);
       }
-      // Steps change state while they run; their metadata is small, so re-read it all.
-      const steps = db.prepare("SELECT metadata FROM steps WHERE metadata IS NOT NULL").all() as Array<{
-        metadata: Uint8Array | null;
-      }>;
-      const started = new Map<string, number>();
-      for (const step of steps) {
-        const meta = decode(step.metadata ? new Uint8Array(step.metadata) : null);
-        const responseId = text(message(meta, [9]), 7);
-        if (!responseId) continue;
-        const at = seconds(message(meta, [1]));
-        if (at > 0) started.set(responseId, at * 1000);
+      // Only re-read `steps` when `gen_metadata` gained new rows or no cache exists yet.
+      let started = previous?.started ?? new Map<string, number>();
+      let subagentSpawnAt = previous?.subagentSpawnAt;
+      if (!previous || rows.length > 0) {
+        const steps = db.prepare("SELECT metadata FROM steps WHERE metadata IS NOT NULL").all() as Array<{
+          metadata: Uint8Array | null;
+        }>;
+        started = new Map<string, number>();
+        for (const step of steps) {
+          const meta = decode(step.metadata ? new Uint8Array(step.metadata) : null);
+          const responseId = text(message(meta, [9]), 7);
+          if (!responseId) continue;
+          const at = seconds(message(meta, [1]));
+          if (at > 0) started.set(responseId, at * 1000);
+        }
+        let earliest = Infinity;
+        for (const ts of started.values()) {
+          if (ts < earliest) earliest = ts;
+        }
+        subagentSpawnAt = Number.isFinite(earliest) ? earliest : undefined;
       }
       const next: FileCache = {
         conversationId,
@@ -411,6 +453,7 @@ export class UsageStatsReader {
         lastGenIndex: nextLastGenIndex,
         generations: nextGenerations,
         started,
+        subagentSpawnAt,
         fallback: previous?.fallback ?? birth,
       };
       this.files.set(file, next);
@@ -436,19 +479,33 @@ export class UsageStatsReader {
     } catch {
       return [];
     }
-    const records: CallRecord[] = [];
-    const seen = new Set<string>();
-    for (const name of names) {
+    const statEntries = await mapConcurrent(names, STAT_CONCURRENCY, async (name) => {
       const conversationId = name.slice(0, -3);
       const file = path.join(dir, name);
+      const [stat, wal] = await Promise.all([
+        fs.stat(file).catch(() => null),
+        fs.stat(`${file}-wal`).catch(() => null),
+      ]);
+      if (!stat) return null;
+      return {
+        conversationId,
+        file,
+        birth: stat.birthtimeMs || stat.mtimeMs,
+        signature: `${stat.mtimeMs}:${stat.size}:${wal?.mtimeMs ?? 0}:${wal?.size ?? 0}`,
+      };
+    });
+    const records: CallRecord[] = [];
+    const seen = new Set<string>();
+    let dbReads = 0;
+    for (const entry of statEntries) {
+      if (!entry) continue;
+      const { conversationId, file, birth, signature } = entry;
       seen.add(file);
-      const stat = await fs.stat(file).catch(() => null);
-      if (!stat) continue;
-      const wal = await fs.stat(`${file}-wal`).catch(() => null);
-      const signature = `${stat.mtimeMs}:${stat.size}:${wal?.mtimeMs ?? 0}:${wal?.size ?? 0}`;
       let cache = this.files.get(file);
       if (!cache || cache.signature !== signature) {
-        cache = (await this.readFile(file, conversationId, signature, stat.birthtimeMs || stat.mtimeMs)) ?? undefined;
+        if (dbReads > 0) await new Promise<void>((resolve) => setImmediate(resolve));
+        dbReads += 1;
+        cache = (await this.readFile(file, conversationId, signature, birth)) ?? undefined;
       }
       if (!cache) continue;
       const parentId = await this.parentOf(conversationId);
@@ -456,14 +513,7 @@ export class UsageStatsReader {
       const turns = await this.turnsForConversation(conversationId);
       // Earliest step timestamp for a subagent (when its parent spawned it), used when an async
       // subagent call finishes after its parent's turn ended while still running in the same process.
-      let subagentSpawnAt: number | undefined;
-      if (isSubagent && cache.started.size > 0) {
-        let earliest = Infinity;
-        for (const ts of cache.started.values()) {
-          if (ts < earliest) earliest = ts;
-        }
-        if (Number.isFinite(earliest)) subagentSpawnAt = earliest;
-      }
+      const subagentSpawnAt = isSubagent ? cache.subagentSpawnAt : undefined;
       // Estimate a missing timestamp for overall totals only. Account attribution requires an actual timestamp.
       let last = cache.fallback;
       for (const generation of cache.generations) {
@@ -489,10 +539,24 @@ export class UsageStatsReader {
   }
 
   private records(): Promise<CallRecord[]> {
+    if (this.cachedRecords && Date.now() - this.cachedRecords.at < COLLECT_CACHE_TTL_MS) {
+      return Promise.resolve(this.cachedRecords.records);
+    }
     // Concurrent requests share one scan.
-    this.running ??= this.collect().finally(() => {
-      this.running = null;
-    });
+    if (!this.running) {
+      const version = this.cacheVersion;
+      const task = this.collect()
+        .then((records) => {
+          if (this.cacheVersion === version) {
+            this.cachedRecords = { at: Date.now(), records };
+          }
+          return records;
+        })
+        .finally(() => {
+          if (this.running === task) this.running = null;
+        });
+      this.running = task;
+    }
     return this.running;
   }
 

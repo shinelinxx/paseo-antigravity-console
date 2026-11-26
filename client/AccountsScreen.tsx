@@ -1,6 +1,6 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import {
   clearCooldownRpc,
@@ -15,6 +15,7 @@ import {
   signOutAccountRpc,
   type AccountSummary,
   type FallbackStrategy,
+  type OrchestratorState,
 } from "../shared/contracts";
 import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
@@ -28,6 +29,8 @@ import { UsageSection } from "./stats";
 import { font, radius, space, tint, type Colors } from "./theme";
 import { Avatar, Button, Callout, Muted } from "./ui";
 import { useAccounts } from "./useAccounts";
+
+const EMPTY_ACCOUNTS: readonly AccountSummary[] = [];
 
 type Dialog =
   | { kind: "add" }
@@ -82,6 +85,77 @@ function AddAccountCard({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
   );
 }
 
+function AccountsGrid({
+  accounts,
+  colors,
+  counts,
+  busy,
+  compact,
+  cardWidth,
+  gap,
+  openMenuId,
+  showAddTile,
+  onToggleMenu,
+  onAction,
+  onAdd,
+}: {
+  accounts: readonly AccountSummary[];
+  colors: Colors;
+  counts: ReadonlyMap<string, number> | null;
+  busy: Readonly<Record<string, CardAction | null>>;
+  compact: boolean;
+  cardWidth: number;
+  gap: number;
+  openMenuId: string | null;
+  showAddTile: boolean;
+  onToggleMenu(accountId: string): void;
+  onAction(account: AccountSummary, action: CardAction): void;
+  onAdd(): void;
+}) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
+      {accounts.map((account, index) => {
+        const isOpen = openMenuId === account.id;
+        return (
+          <View
+            key={account.id}
+            style={{
+              width: cardWidth || "100%",
+              alignSelf: "stretch",
+              zIndex: isOpen ? 100 : accounts.length - index,
+            }}
+          >
+            <AccountCard
+              account={account}
+              colors={colors}
+              count={counts ? (counts.get(account.id) ?? 0) : undefined}
+              now={now}
+              busy={busy[account.id] ?? null}
+              compact={compact}
+              canMoveUp={index > 0}
+              canMoveDown={index < accounts.length - 1}
+              menuOpen={isOpen}
+              onToggleMenu={() => onToggleMenu(account.id)}
+              onAction={(action) => onAction(account, action)}
+            />
+          </View>
+        );
+      })}
+      {showAddTile ? (
+        <View style={{ width: cardWidth || "100%", alignSelf: "stretch" }}>
+          <AddAccountCard colors={colors} onAdd={onAdd} />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 export function AccountsScreen({ theme, layout, navigation, host, observation }: PluginSurfaceProps & { observation: AgentObservation }) {
   const { colors } = theme;
   const { t } = useTranslation(messages);
@@ -103,17 +177,23 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [busy, setBusy] = useState<Record<string, CardAction | null>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
-  const [now, setNow] = useState(Date.now);
   const [width, setWidth] = useState(0);
   const dialogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 30_000);
     return () => {
-      clearInterval(timer);
       if (dialogTimerRef.current) clearTimeout(dialogTimerRef.current);
     };
   }, []);
+
+  const handleOrchestratorChange = useCallback(
+    (state: OrchestratorState) => observation.setOrchestrator(state),
+    [observation],
+  );
+  const handleToggleMenu = useCallback((accountId: string) => {
+    setOpenMenuId((current) => (current === accountId ? null : accountId));
+  }, []);
+  const handleAddDialog = useCallback(() => setDialog({ kind: "add" }), []);
 
   const compact = layout.compact || (width > 0 && width < 560);
   const useModalMenu = compact || Platform.OS !== "web";
@@ -285,7 +365,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           ) : null}
 
           {contentWidth > 0 ? (
-            <UsageSection colors={colors} width={contentWidth} compact={compact} accounts={data?.accounts ?? []} />
+            <UsageSection colors={colors} width={contentWidth} compact={compact} accounts={data?.accounts ?? EMPTY_ACCOUNTS} />
           ) : null}
 
           {!data && !error ? (
@@ -298,40 +378,20 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           {data ? (
             <View style={{ gap: space.md, zIndex: openMenuId ? 20 : 0 }}>
               <SectionTitle colors={colors} title={t("accountsHeading")} count={data.accounts.length} />
-              <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
-                {data.accounts.map((account, index) => {
-                  const isOpen = openMenuId === account.id;
-                  return (
-                    <View
-                      key={account.id}
-                      style={{
-                        width: cardWidth || "100%",
-                        alignSelf: "stretch",
-                        zIndex: isOpen ? 100 : data.accounts.length - index,
-                      }}
-                    >
-                      <AccountCard
-                        account={account}
-                        colors={colors}
-                        count={counts ? (counts.get(account.id) ?? 0) : undefined}
-                        now={now}
-                        busy={busy[account.id] ?? null}
-                        compact={compact}
-                        canMoveUp={index > 0}
-                        canMoveDown={index < data.accounts.length - 1}
-                        menuOpen={isOpen}
-                        onToggleMenu={() => setOpenMenuId((current) => (current === account.id ? null : account.id))}
-                        onAction={(action) => onAction(account, action)}
-                      />
-                    </View>
-                  );
-                })}
-                {showAddTile ? (
-                  <View style={{ width: cardWidth || "100%", alignSelf: "stretch" }}>
-                    <AddAccountCard colors={colors} onAdd={() => setDialog({ kind: "add" })} />
-                  </View>
-                ) : null}
-              </View>
+              <AccountsGrid
+                accounts={data.accounts}
+                colors={colors}
+                counts={counts}
+                busy={busy}
+                compact={compact}
+                cardWidth={cardWidth}
+                gap={gap}
+                openMenuId={openMenuId}
+                showAddTile={showAddTile}
+                onToggleMenu={handleToggleMenu}
+                onAction={onAction}
+                onAdd={handleAddDialog}
+              />
             </View>
           ) : null}
 
@@ -389,7 +449,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
                 />
-                <OrchestratorRows colors={colors} accounts={data.accounts} onChange={(state) => observation.setOrchestrator(state)} />
+                <OrchestratorRows colors={colors} accounts={data.accounts} onChange={handleOrchestratorChange} />
                 <SettingsRow label={t("overview.cli")} hint={data.agyPath ?? undefined}>
                   <Text style={{ ...font.small, color: data.agyPath ? colors.foreground : colors.statusWarning }}>
                     {data.agyPath ? t("overview.cliValue", { version: data.agyVersion ?? "?" }) : t("overview.cliMissing")}

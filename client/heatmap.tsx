@@ -222,7 +222,7 @@ function Figure({ colors, label, value, detail }: { colors: Colors; label: strin
   );
 }
 
-export function ActivityCalendar({
+export const ActivityCalendar = memo(function ActivityCalendar({
   colors,
   width,
   compact,
@@ -287,7 +287,17 @@ export function ActivityCalendar({
   }, []);
   // A cell index means a different day once the number of weeks changes.
   useEffect(() => setActive(null), [weeks]);
-  const levelColor = (level: Level) => (level === 0 ? tint(colors.foreground, 0.07) : tint(colors.accent, LEVEL_ALPHA[level]));
+  const levelColors = useMemo(
+    () =>
+      [
+        tint(colors.foreground, 0.07),
+        tint(colors.accent, LEVEL_ALPHA[1]),
+        tint(colors.accent, LEVEL_ALPHA[2]),
+        tint(colors.accent, LEVEL_ALPHA[3]),
+        tint(colors.accent, LEVEL_ALPHA[4]),
+      ] as const,
+    [colors.foreground, colors.accent],
+  );
   const monthLabels = useMemo(() => {
     const placed: Array<{ key: string; left: number; label: string }> = [];
     const maxLeft = Math.max(0, gridWidth - 28);
@@ -332,7 +342,7 @@ export function ActivityCalendar({
     <View style={{ flexDirection: "row", alignItems: "center", gap: 3 }} accessibilityLabel={t("stats.calendar.legend")}>
       <Text style={{ ...font.caption, color: colors.foregroundMuted, marginRight: 3 }}>{t("stats.calendar.less")}</Text>
       {LEVELS.map((level) => (
-        <View key={level} style={{ width: cell, height: cell, borderRadius: corner, backgroundColor: levelColor(level) }} />
+        <View key={level} style={{ width: cell, height: cell, borderRadius: corner, backgroundColor: levelColors[level] }} />
       ))}
       <Text style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 3 }}>{t("stats.calendar.more")}</Text>
     </View>
@@ -405,7 +415,7 @@ export function ActivityCalendar({
                       pitch={pitch}
                       size={cell}
                       corner={corner}
-                      color={levelColor(day.level)}
+                      color={levelColors[day.level]}
                       label={labels[column]?.[row] ?? ""}
                       onEnter={enter}
                       onTap={tap}
@@ -507,4 +517,4 @@ export function ActivityCalendar({
       </View>
     </Card>
   );
-}
+});

@@ -152,47 +152,76 @@ interface AgentInfo {
 }
 
 const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const MAX_AGENTS_CACHE = 500;
 
 export function conversationIdFrom(persistence: unknown): string | null {
   if (!persistence) return null;
-  const text = JSON.stringify(persistence);
-  const named = /"conversationId"\s*:\s*"([0-9a-f-]{36})"/i.exec(text)?.[1];
-  if (named) return named;
+  if (typeof persistence === "string") {
+    return CONVERSATION_ID.test(persistence) ? persistence : (UUID_IN_TEXT.exec(persistence)?.[0] ?? null);
+  }
   if (typeof persistence === "object") {
-    const record = persistence as { sessionId?: unknown; nativeHandle?: unknown };
-    for (const candidate of [record.nativeHandle, record.sessionId]) {
+    const record = persistence as {
+      conversationId?: unknown;
+      nativeHandle?: unknown;
+      sessionId?: unknown;
+    };
+    for (const candidate of [record.conversationId, record.nativeHandle, record.sessionId]) {
       if (typeof candidate === "string" && CONVERSATION_ID.test(candidate)) return candidate;
     }
   }
+  const text = JSON.stringify(persistence);
+  const named = /"conversationId"\s*:\s*"([0-9a-f-]{36})"/i.exec(text)?.[1];
+  if (named) return named;
   return UUID_IN_TEXT.exec(text)?.[0] ?? null;
 }
 
 /** Maps agents to their agy conversations, re-reading each agent's snapshot every 20 seconds. */
 export class ContextReader {
   private readonly agents = new Map<string, AgentInfo>();
+  private readonly inflight = new Map<string, Promise<AgentInfo | null>>();
 
-  private async info(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
-    const cached = this.agents.get(agentId);
-    if (cached && Date.now() - cached.fetchedAt < 20_000) return cached;
-    const refreshed = await paseo.agents
-      .ref(agentId)
-      .refresh()
-      .catch(() => null);
-    if (!refreshed) {
-      this.agents.delete(agentId);
-      return null;
-    }
-    const agent = refreshed.agent;
-    const info: AgentInfo = {
-      conversationId: conversationIdFrom(agent.persistence),
-      model: agent.model ?? null,
-      closed: agent.status === "closed" || agent.status === "error",
-      native: typeof agent.lastUsage?.contextWindowMaxTokens === "number",
-      antigravity: isAntigravityProvider(agent.provider),
-      fetchedAt: Date.now(),
-    };
+  private rememberAgent(agentId: string, info: AgentInfo): void {
+    this.agents.delete(agentId);
     this.agents.set(agentId, info);
-    return info;
+    if (this.agents.size > MAX_AGENTS_CACHE) {
+      const oldest = this.agents.keys().next().value;
+      if (oldest) this.agents.delete(oldest);
+    }
+  }
+
+  private info(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
+    const cached = this.agents.get(agentId);
+    if (cached && Date.now() - cached.fetchedAt < 20_000) {
+      this.rememberAgent(agentId, cached);
+      return Promise.resolve(cached);
+    }
+    const existing = this.inflight.get(agentId);
+    if (existing) return existing;
+    const task = (async () => {
+      const refreshed = await paseo.agents
+        .ref(agentId)
+        .refresh()
+        .catch(() => null);
+      if (!refreshed) {
+        this.agents.delete(agentId);
+        return null;
+      }
+      const agent = refreshed.agent;
+      const info: AgentInfo = {
+        conversationId: conversationIdFrom(agent.persistence),
+        model: agent.model ?? null,
+        closed: agent.status === "closed" || agent.status === "error",
+        native: typeof agent.lastUsage?.contextWindowMaxTokens === "number",
+        antigravity: isAntigravityProvider(agent.provider),
+        fetchedAt: Date.now(),
+      };
+      this.rememberAgent(agentId, info);
+      return info;
+    })().finally(() => {
+      if (this.inflight.get(agentId) === task) this.inflight.delete(agentId);
+    });
+    this.inflight.set(agentId, task);
+    return task;
   }
 
   async usage(

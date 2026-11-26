@@ -46,7 +46,7 @@ export type StoredAccount = z.infer<typeof storedAccountSchema>;
 export type StoreData = z.infer<typeof storeSchema>;
 
 /** Normalizes the priority order so every existing account id appears once. */
-export function orderedAccountIds(data: StoreData): string[] {
+export function orderedAccountIds(data: Readonly<StoreData>): string[] {
   const valid = new Set<string>([SYSTEM_ACCOUNT_ID, ...data.accounts.map((account) => account.id)]);
   const seen = new Set<string>();
   const result: string[] = [];
@@ -93,6 +93,10 @@ export class AccountStore {
       }
     })();
     await this.loaded;
+    return this.data;
+  }
+
+  readonlyData(): Readonly<StoreData> {
     return this.data;
   }
 

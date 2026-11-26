@@ -1,6 +1,6 @@
 import { useRpc, useTranslation } from "@getpaseo/plugin/client";
 import { Icon, Modal, SettingsSelect, TextInput, useToast } from "@getpaseo/plugin/client/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   RECOVERY_FOLDER_NAME,
@@ -314,8 +314,12 @@ export function AccountAgentsDialog({
   const toast = useToast();
   const migrate = useRpc(migrateAccountAgentsRpc);
   const label = displayLabel(account.label, t, account.kind);
-  const targets = accounts.filter(
-    (entry) => entry.id !== account.id && entry.usable && entry.status !== "signed-out",
+  const targets = useMemo(
+    () =>
+      accounts.filter(
+        (entry) => entry.id !== account.id && entry.usable && entry.status !== "signed-out",
+      ),
+    [accounts, account.id],
   );
   const [targetId, setTargetId] = useState<string>(targets[0]?.id ?? "");
   const [mode, setMode] = useState<"after-turn" | "idle-only" | "now">("after-turn");

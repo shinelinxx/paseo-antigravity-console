@@ -24,6 +24,33 @@ export function normalizeEchoText(text: string): string {
     .join("\n");
 }
 
+/** Extracts the first non-empty trimmed line using indexOf (zero array allocations). */
+export function firstNonEmptyLine(text: string): { line: string; hasMore: boolean } {
+  const len = text.length;
+  let start = 0;
+  while (start < len) {
+    let end = text.indexOf("\n", start);
+    if (end < 0) end = len;
+    const trimmed = text.slice(start, end).trim();
+    if (trimmed.length > 0) {
+      let nextStart = end + 1;
+      let hasMore = false;
+      while (nextStart < len) {
+        let nextEnd = text.indexOf("\n", nextStart);
+        if (nextEnd < 0) nextEnd = len;
+        if (text.slice(nextStart, nextEnd).trim().length > 0) {
+          hasMore = true;
+          break;
+        }
+        nextStart = nextEnd + 1;
+      }
+      return { line: trimmed, hasMore };
+    }
+    start = end + 1;
+  }
+  return { line: "", hasMore: false };
+}
+
 /** Exact chat fallback text `agy acp` emits in `askQuestionInChat` when the client lacks form elicitation. */
 export function formatQuestionEcho(questions: readonly AskQuestionEntry[]): string {
   return normalizeEchoText(

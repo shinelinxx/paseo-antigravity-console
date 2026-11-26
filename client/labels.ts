@@ -22,26 +22,47 @@ export function shortPlan(plan: string | null | undefined, label: string): strin
   return compact;
 }
 
+type ListFormatter = { format(list: readonly string[]): string };
+const listFormatters = new Map<string, ListFormatter | null>();
+
+function getListFormatter(locale: string): ListFormatter | null {
+  let formatter = listFormatters.get(locale);
+  if (formatter === undefined) {
+    formatter = null;
+    try {
+      const ListFormat =
+        typeof Intl !== "undefined"
+          ? (
+              Intl as {
+                ListFormat?: new (
+                  locale: string,
+                  options: { style: string; type: string },
+                ) => ListFormatter;
+              }
+            ).ListFormat
+          : undefined;
+      if (typeof ListFormat === "function") {
+        formatter = new ListFormat(locale, { style: "narrow", type: "conjunction" });
+      }
+    } catch {
+      // Fallback below.
+    }
+    listFormatters.set(locale, formatter);
+  }
+  return formatter;
+}
+
 /** Formats a list of names using locale-appropriate punctuation (e.g. `, ` in English, `、` in Chinese). */
 export function joinList(items: readonly string[], locale: string): string {
   if (items.length <= 1) return items[0] ?? "";
-  try {
-    const ListFormat =
-      typeof Intl !== "undefined"
-        ? (
-            Intl as {
-              ListFormat?: new (
-                locale: string,
-                options: { style: string; type: string },
-              ) => { format(list: readonly string[]): string };
-            }
-          ).ListFormat
-        : undefined;
-    if (typeof ListFormat === "function") {
-      return new ListFormat(safeLocale(locale), { style: "narrow", type: "conjunction" }).format(items);
+  const loc = safeLocale(locale);
+  const formatter = getListFormatter(loc);
+  if (formatter) {
+    try {
+      return formatter.format(items);
+    } catch {
+      // Fallback below.
     }
-  } catch {
-    // Fallback below.
   }
-  return items.join(safeLocale(locale).toLowerCase().startsWith("zh") ? "、" : ", ");
+  return items.join(loc.toLowerCase().startsWith("zh") ? "、" : ", ");
 }

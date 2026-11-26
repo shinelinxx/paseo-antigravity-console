@@ -8,7 +8,7 @@ import {
 } from "@getpaseo/plugin/client";
 import { Icon, Markdown, ScrollView, TextInput, copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View, type ScrollView as NativeScrollView } from "react-native";
 import {
   isAntigravityProvider,
@@ -60,6 +60,10 @@ const STATE_ICON: Record<ShownState, string> = {
 
 /** Which subagent a panel should show when it opens, per agent. */
 const requested = new Map<string, string>();
+const EMPTY_SUBAGENTS: readonly SubagentSummary[] = [];
+const EMPTY_ENTRIES: readonly TranscriptEntry[] = [];
+const EMPTY_ARTIFACTS: readonly SubagentArtifactInfo[] = [];
+const EMPTY_OVERRIDES: Readonly<Record<string, ModelRates>> = {};
 
 export function useSubagents(agentId: string, enabled = true, fastPoll = false) {
   const list = useRpc(listSubagentsRpc);
@@ -69,7 +73,7 @@ export function useSubagents(agentId: string, enabled = true, fastPoll = false) 
     enabled,
     staleTime: 1000,
     refetchInterval: (query) =>
-      fastPoll || query.state.data?.subagents.some((subagent) => subagent.state === "running") ? 3000 : 15000,
+      fastPoll || query.state.data?.subagents.some((subagent) => subagent.state === "running") ? 3000 : false,
   });
 }
 
@@ -245,7 +249,7 @@ export function createSubagentViews(client: PluginClientContext) {
     const card = item.data;
     const query = useSubagents(agentId, true, card.status === "running");
     const pricing = usePricing();
-    const overrides = pricing.data?.overrides ?? {};
+    const overrides = pricing.data?.overrides ?? EMPTY_OVERRIDES;
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
     const summary = useMemo(() => {
       const subagents = query.data?.subagents;
@@ -417,7 +421,7 @@ export function createSubagentViews(client: PluginClientContext) {
 
   function SubagentsPanel({ theme, layout, params, revision }: PluginAgentPanelProps) {
     const { colors } = theme;
-    const { t } = useTranslation(messages);
+    const { t, locale } = useTranslation(messages);
     const agentId = params.agentId;
     const agentInfo = useAgent(
       agentId,
@@ -426,7 +430,10 @@ export function createSubagentViews(client: PluginClientContext) {
     const [agentProvider = "", agentBusy = "0"] = (agentInfo ?? "").split("|");
     const antigravity = isAntigravityProvider(agentProvider);
     const query = useSubagents(agentId, antigravity, agentBusy === "1");
-    const list = query.data?.subagents ?? [];
+    const pricing = usePricing();
+    const overrides = pricing.data?.overrides ?? EMPTY_OVERRIDES;
+    const list = query.data?.subagents ?? EMPTY_SUBAGENTS;
+    const byId = useMemo(() => new Map(list.map((entry) => [entry.id, entry])), [list]);
     const [selected, setSelected] = useState<string | null>(null);
     const [filter, setFilter] = useState<ListFilter>("all");
     const [search, setSearch] = useState("");
@@ -531,10 +538,12 @@ export function createSubagentViews(client: PluginClientContext) {
               key={subagent.id}
               colors={colors}
               subagent={subagent}
-              parent={list.find((other) => other.id === subagent.parentId)}
+              parent={byId.get(subagent.parentId)}
               active={!layout.compact && current?.id === subagent.id}
-              onPress={() => setSelected(subagent.id)}
+              onSelect={setSelected}
               t={t}
+              locale={locale}
+              overrides={overrides}
             />
           ))
         )}
@@ -608,31 +617,32 @@ function Empty({ colors, icon, text }: { colors: Colors; icon: string; text: str
   );
 }
 
-function ListRow({
+const ListRow = memo(function ListRow({
   colors,
   subagent,
   parent,
   active,
-  onPress,
+  onSelect,
   t,
+  locale,
+  overrides,
 }: {
   colors: Colors;
   subagent: SubagentSummary;
   parent: SubagentSummary | undefined;
   active: boolean;
-  onPress(): void;
+  onSelect(id: string): void;
   t: Translate;
+  locale: string;
+  overrides: Readonly<Record<string, ModelRates>>;
 }) {
-  const { locale } = useTranslation(messages);
-  const pricing = usePricing();
-  const overrides = pricing.data?.overrides ?? {};
   const color = toneColor(colors, STATE_TONE[subagent.state]);
   const activity = activityLine(subagent, t);
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ selected: active }}
-      onPress={onPress}
+      onPress={() => onSelect(subagent.id)}
       style={(pressState) => ({
         flexDirection: "row",
         gap: space.sm,
@@ -684,7 +694,7 @@ function ListRow({
       </View>
     </Pressable>
   );
-}
+});
 
 function ArtifactPreview({
   colors,
@@ -760,7 +770,7 @@ function Detail({
   const toast = useToast();
   const read = useRpc(subagentDetailRpc);
   const pricing = usePricing();
-  const overrides = pricing.data?.overrides ?? {};
+  const overrides = pricing.data?.overrides ?? EMPTY_OVERRIDES;
   const scrollRef = useRef<NativeScrollView | null>(null);
   const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
   const [activitySearch, setActivitySearch] = useState("");
@@ -775,14 +785,19 @@ function Detail({
     refetchInterval: summary.state === "running" ? 3000 : false,
   });
   const { refetch: refetchDetail } = query;
+  const mountedRef = useRef(false);
   useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
     void refetchDetail();
   }, [summary.state, summary.steps, summary.reportedAt, summary.updatedAt, refetchDetail]);
   const detail = query.data;
-  const entries = detail?.entries ?? [];
-  const artifacts = detail?.artifacts ?? [];
-  const task = entries.find((entry) => entry.kind === "task");
-  const rawActivity = entries.filter((entry) => entry.kind !== "task");
+  const entries = detail?.entries ?? EMPTY_ENTRIES;
+  const artifacts = detail?.artifacts ?? EMPTY_ARTIFACTS;
+  const task = useMemo(() => entries.find((entry) => entry.kind === "task"), [entries]);
+  const rawActivity = useMemo(() => entries.filter((entry) => entry.kind !== "task"), [entries]);
 
   const activity = useMemo(() => {
     const q = activitySearch.trim().toLowerCase();
@@ -1151,7 +1166,7 @@ function Expandable({
   );
 }
 
-function EntryRow({ colors, entry, t, locale }: { colors: Colors; entry: TranscriptEntry; t: Translate; locale: string }) {
+const EntryRow = memo(function EntryRow({ colors, entry, t, locale }: { colors: Colors; entry: TranscriptEntry; t: Translate; locale: string }) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const time = clock(entry.at, locale);
   return (
@@ -1195,9 +1210,9 @@ function EntryRow({ colors, entry, t, locale }: { colors: Colors; entry: Transcr
       </View>
     </View>
   );
-}
+});
 
-function ToolRow({ colors, tool, t }: { colors: Colors; tool: TranscriptEntry["tools"][number]; t: Translate }) {
+const ToolRow = memo(function ToolRow({ colors, tool, t }: { colors: Colors; tool: TranscriptEntry["tools"][number]; t: Translate }) {
   const [open, setOpen] = useState(false);
   const color = tool.failed ? colors.statusDanger : colors.foregroundMuted;
   const icon = useMemo(() => toolIcon(tool.name), [tool.name]);
@@ -1245,4 +1260,4 @@ function ToolRow({ colors, tool, t }: { colors: Colors; tool: TranscriptEntry["t
       ) : null}
     </View>
   );
-}
+});

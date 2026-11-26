@@ -187,6 +187,22 @@ export const DEFAULT_PRICING: readonly DefaultPricingEntry[] = [
 
 const BY_KEY = new Map<string, DefaultPricingEntry>(DEFAULT_PRICING.map((entry) => [entry.key, entry]));
 
+const SCHEDULED_RATES = new WeakMap<
+  DefaultPricingEntry,
+  ReadonlyArray<{ effectiveFromMs: number; rates: ModelRates }>
+>();
+for (const entry of DEFAULT_PRICING) {
+  if (entry.scheduled?.length) {
+    SCHEDULED_RATES.set(
+      entry,
+      entry.scheduled.map((change) => ({
+        effectiveFromMs: Date.parse(change.effectiveFrom),
+        rates: change.rates,
+      })),
+    );
+  }
+}
+
 export function defaultPricingEntry(key: string): DefaultPricingEntry | undefined {
   return BY_KEY.get(key);
 }
@@ -243,6 +259,13 @@ export function resolvePricingKey(modelId: string | null | undefined, label: str
 /** Returns the official rate applicable at timestamp `at` (ms since epoch). */
 export function officialRatesAt(entry: DefaultPricingEntry, at: number): ModelRates {
   let active = entry.rates;
+  const scheduled = SCHEDULED_RATES.get(entry);
+  if (scheduled) {
+    for (const change of scheduled) {
+      if (Number.isFinite(change.effectiveFromMs) && at >= change.effectiveFromMs) active = change.rates;
+    }
+    return active;
+  }
   for (const change of entry.scheduled ?? []) {
     const start = Date.parse(change.effectiveFrom);
     if (Number.isFinite(start) && at >= start) active = change.rates;

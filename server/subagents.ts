@@ -27,6 +27,8 @@ const STALE_MS = 12 * 60_000;
 const MAX_DEPTH = 3;
 const MAX_ENTRIES = 300;
 const MAX_LOG_CACHE = 120;
+const MAX_LIST_CACHE = 250;
+const CHILD_CONCURRENCY = 6;
 const MAX_ARTIFACT_BYTES = 256 * 1024;
 /** Step states agy may still rewrite in place. */
 const UNFINISHED = new Set(["RUNNING", "PENDING", "GENERATING", "WAITING", "QUEUED"]);
@@ -68,6 +70,25 @@ interface CachedLog {
   rows: Row[];
   /** Byte offset where each row's line starts. */
   starts: number[];
+  children?: Child[];
+}
+
+async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function brainDir(conversationId: string): string {
@@ -130,12 +151,13 @@ const SUMMARY_KEYS = [
   "Action",
 ];
 
+const PATH_LIKE = new Set(["Path", "AbsolutePath", "TargetFile", "File", "DirectoryPath", "SearchPath"]);
+
 export function describeCall(call: ToolCall): string {
-  const pathLike = new Set(["Path", "AbsolutePath", "TargetFile", "File", "DirectoryPath", "SearchPath"]);
   for (const key of SUMMARY_KEYS) {
     const value = argText(call, key);
     if (!value) continue;
-    if (pathLike.has(key)) {
+    if (PATH_LIKE.has(key)) {
       const start = argText(call, "StartLine");
       const end = argText(call, "EndLine");
       const range = start && end ? ` ${start}–${end}` : "";
@@ -240,7 +262,12 @@ async function listArtifacts(conversationId: string): Promise<SubagentArtifactIn
 
 export class SubagentReader {
   private readonly logs = new Map<string, CachedLog>();
+  private readonly reportsCache = new Map<
+    string,
+    { mtimeMs: number; reports: Map<string, { at: string | null; content: string }> }
+  >();
   private readonly listCache = new Map<string, { at: number; value: SubagentList }>();
+  private readonly listInflight = new Map<string, Promise<SubagentList>>();
 
   constructor(private readonly agents: ContextReader) {}
 
@@ -253,18 +280,39 @@ export class SubagentReader {
     }
   }
 
+  private rememberReports(
+    dir: string,
+    entry: { mtimeMs: number; reports: Map<string, { at: string | null; content: string }> },
+  ): void {
+    this.reportsCache.delete(dir);
+    this.reportsCache.set(dir, entry);
+    if (this.reportsCache.size > MAX_LOG_CACHE) {
+      const oldest = this.reportsCache.keys().next().value;
+      if (oldest) this.reportsCache.delete(oldest);
+    }
+  }
+
+  private rememberList(agentId: string, entry: { at: number; value: SubagentList }): void {
+    this.listCache.delete(agentId);
+    this.listCache.set(agentId, entry);
+    if (this.listCache.size > MAX_LIST_CACHE) {
+      const oldest = this.listCache.keys().next().value;
+      if (oldest) this.listCache.delete(oldest);
+    }
+  }
+
   /**
    * Reads a conversation log incrementally. agy appends a line per step and rewrites a step's line
    * while it runs, so reading resumes at the earliest step that may still change.
    */
-  private async rows(conversationId: string): Promise<{ rows: Row[]; mtimeMs: number } | null> {
+  private async rows(conversationId: string): Promise<CachedLog | null> {
     const file = logPath(conversationId);
     const stat = await fs.stat(file).catch(() => null);
     if (!stat?.isFile()) return null;
     const cached = this.logs.get(file);
     if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
       this.rememberLog(file, cached);
-      return { rows: cached.rows, mtimeMs: stat.mtimeMs };
+      return cached;
     }
     let keep = 0;
     if (cached?.rows.length) {
@@ -291,7 +339,7 @@ export class SubagentReader {
       : { size: stat.size, mtimeMs: stat.mtimeMs, ...((await readRows(file, 0, stat.size)) ?? { rows: [], starts: [] }) };
     dedupe(next);
     this.rememberLog(file, next);
-    return { rows: next.rows, mtimeMs: stat.mtimeMs };
+    return next;
   }
 
   /**
@@ -302,7 +350,9 @@ export class SubagentReader {
   private async children(conversationId: string): Promise<Child[]> {
     const log = await this.rows(conversationId);
     if (!log) return [];
+    if (log.children) return log.children;
     const found: Child[] = [];
+    const seenIds = new Set<string>();
     const killed = new Map<string, string>();
     const listed = new Map<string, { role: string | null; type: string | null }>();
     let queue: ToolCall[] = [];
@@ -337,7 +387,8 @@ export class SubagentReader {
       }
       if (call.name !== "invoke_subagent") continue;
       const id = CREATED_ID.exec(row.content)?.[1];
-      if (!id || !UUID.test(id) || found.some((child) => child.id === id)) continue;
+      if (!id || !UUID.test(id) || seenIds.has(id)) continue;
+      seenIds.add(id);
       found.push({
         id,
         role: argText(call, "Role"),
@@ -352,13 +403,24 @@ export class SubagentReader {
       child.role ??= entry?.role ?? null;
       child.type ??= entry?.type ?? null;
     }
+    log.children = found;
     return found;
   }
 
   /** Messages a conversation received, by sender. */
   private async reports(conversationId: string): Promise<Map<string, { at: string | null; content: string }>> {
-    const result = new Map<string, { at: string | null; content: string }>();
     const dir = inboxDir(conversationId);
+    const stat = await fs.stat(dir).catch(() => null);
+    if (!stat?.isDirectory()) {
+      this.reportsCache.delete(dir);
+      return new Map();
+    }
+    const cached = this.reportsCache.get(dir);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      this.rememberReports(dir, cached);
+      return cached.reports;
+    }
+    const result = new Map<string, { at: string | null; content: string }>();
     const names = await fs.readdir(dir).catch(() => [] as string[]);
     for (const name of names) {
       if (!name.endsWith(".json") || name === "read.json") continue;
@@ -378,6 +440,7 @@ export class SubagentReader {
         // Not a message file.
       }
     }
+    this.rememberReports(dir, { mtimeMs: stat.mtimeMs, reports: result });
     return result;
   }
 
@@ -387,8 +450,8 @@ export class SubagentReader {
     depth: number,
     reported: { at: string | null; content: string } | undefined,
     parentClosed: boolean,
+    log: { rows: Row[]; mtimeMs: number } | null,
   ): Promise<SubagentSummary> {
-    const log = await this.rows(child.id);
     const rows = log?.rows ?? [];
     let tools = 0;
     let input = 0;
@@ -439,12 +502,11 @@ export class SubagentReader {
       state = "stopped";
       phase = null;
     }
-    const activity =
-      state === "running" && phase === "thinking"
-        ? null
-        : lastCall
-          ? `${lastCall.name}${describeCall(lastCall) ? ` · ${describeCall(lastCall)}` : ""}`
-          : null;
+    let activity: string | null = null;
+    if (!(state === "running" && phase === "thinking") && lastCall) {
+      const desc = describeCall(lastCall);
+      activity = desc ? `${lastCall.name} · ${desc}` : lastCall.name;
+    }
     const updatedAt = last?.created_at ?? (touched ? new Date(touched).toISOString() : null);
     return {
       id: child.id,
@@ -479,26 +541,41 @@ export class SubagentReader {
     const children = await this.children(conversationId);
     if (!children.length) return;
     const inbox = await this.reports(conversationId);
-    for (const child of children) {
+    const branches = await mapConcurrent(children, CHILD_CONCURRENCY, async (child) => {
       // Only a conversation whose first message came from this parent is its child.
       const own = await this.rows(child.id);
-      if (own && sentBy(own.rows, conversationId) === false) continue;
-      const summary = await this.summarize(child, conversationId, depth, inbox.get(child.id), parentClosed);
-      out.push(summary);
-      await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", out);
+      if (own && sentBy(own.rows, conversationId) === false) return null;
+      const summary = await this.summarize(child, conversationId, depth, inbox.get(child.id), parentClosed, own);
+      const branch: SubagentSummary[] = [summary];
+      await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", branch);
+      return branch;
+    });
+    for (const branch of branches) {
+      if (branch) out.push(...branch);
     }
   }
 
-  async list(paseo: PaseoApi, agentId: string): Promise<SubagentList> {
+  list(paseo: PaseoApi, agentId: string): Promise<SubagentList> {
     const cached = this.listCache.get(agentId);
-    if (cached && Date.now() - cached.at < 1500) return cached.value;
-    const info = await this.agents.conversationOf(paseo, agentId);
-    const value: SubagentList = { conversationId: info?.conversationId ?? null, subagents: [] };
-    if (info?.conversationId) {
-      await this.collect(info.conversationId, 1, info.closed, value.subagents);
+    if (cached && Date.now() - cached.at < 1500) {
+      this.rememberList(agentId, cached);
+      return Promise.resolve(cached.value);
     }
-    this.listCache.set(agentId, { at: Date.now(), value });
-    return value;
+    const inflight = this.listInflight.get(agentId);
+    if (inflight) return inflight;
+    const task = (async () => {
+      const info = await this.agents.conversationOf(paseo, agentId);
+      const value: SubagentList = { conversationId: info?.conversationId ?? null, subagents: [] };
+      if (info?.conversationId) {
+        await this.collect(info.conversationId, 1, info.closed, value.subagents);
+      }
+      this.rememberList(agentId, { at: Date.now(), value });
+      return value;
+    })().finally(() => {
+      if (this.listInflight.get(agentId) === task) this.listInflight.delete(agentId);
+    });
+    this.listInflight.set(agentId, task);
+    return task;
   }
 
   async counts(paseo: PaseoApi, agentIds: readonly string[]): Promise<Record<string, { total: number; running: number }>> {
@@ -655,8 +732,14 @@ export class SubagentReader {
   forget(agentId: string): void {
     const cached = this.listCache.get(agentId);
     if (cached) {
-      if (cached.value.conversationId) this.logs.delete(logPath(cached.value.conversationId));
-      for (const subagent of cached.value.subagents) this.logs.delete(logPath(subagent.id));
+      if (cached.value.conversationId) {
+        this.logs.delete(logPath(cached.value.conversationId));
+        this.reportsCache.delete(inboxDir(cached.value.conversationId));
+      }
+      for (const subagent of cached.value.subagents) {
+        this.logs.delete(logPath(subagent.id));
+        this.reportsCache.delete(inboxDir(subagent.id));
+      }
     }
     this.listCache.delete(agentId);
   }
@@ -719,9 +802,11 @@ function dedupe(log: CachedLog): void {
     const row = log.rows[index]!;
     if (kept.has(row.step_index)) continue;
     kept.add(row.step_index);
-    rows.unshift(row);
-    starts.unshift(log.starts[index]!);
+    rows.push(row);
+    starts.push(log.starts[index]!);
   }
+  rows.reverse();
+  starts.reverse();
   log.rows = rows;
   log.starts = starts;
 }

@@ -28,13 +28,27 @@ export const CREDENTIAL_NAME = /(auth|token|cred|oauth|keyring|secret|account)/i
 const locks = new Map<string, Promise<unknown>>();
 let settingsSeq = 0;
 
+interface ProfileSyncState {
+  realHomeMtimeMs: number;
+  realGeminiMtimeMs: number;
+  settingsMtimeMs: number;
+  orchestratorKey: string;
+}
+
+const syncedProfiles = new Map<string, ProfileSyncState>();
+const lastSettingsBody = new Map<string, string>();
+
 function withLock<T>(key: string, task: () => Promise<T>): Promise<T> {
   const previous = locks.get(key) ?? Promise.resolve();
   const next = previous.then(task, task);
-  locks.set(
-    key,
-    next.catch(() => undefined),
+  const marker = next.then(
+    () => undefined,
+    () => undefined,
   );
+  locks.set(key, marker);
+  void marker.finally(() => {
+    if (locks.get(key) === marker) locks.delete(key);
+  });
   return next;
 }
 
@@ -99,16 +113,48 @@ async function mirror(
   skip: (name: string) => boolean,
 ): Promise<void> {
   const keep = new Set<string>();
+  const tasks: Array<Promise<void>> = [];
   for (const entry of await readDirSafe(sourceDir)) {
     if (skip(entry.name)) continue;
     keep.add(entry.name);
-    await ensureLink(path.join(destinationDir, entry.name), path.join(sourceDir, entry.name));
+    tasks.push(ensureLink(path.join(destinationDir, entry.name), path.join(sourceDir, entry.name)));
   }
+  await Promise.all(tasks);
   await pruneLinks(destinationDir, sourceDir, keep);
 }
 
 async function syncProfile(accountId: string, orchestratorOverride?: OrchestratorChoice | null): Promise<string> {
   const home = profileHome(accountId);
+  const cli = profileCliDir(accountId);
+  const orchestratorKey = orchestratorOverride
+    ? `${orchestratorOverride.planner ?? ""}\0${orchestratorOverride.executor ?? ""}`
+    : "";
+  const [homeStat, geminiStat, settingsStat, cliStat] = await Promise.all([
+    fs.stat(REAL_HOME).catch(() => null),
+    fs.stat(REAL_GEMINI).catch(() => null),
+    fs.stat(REAL_SETTINGS_FILE).catch(() => null),
+    fs.lstat(cli).catch(() => null),
+  ]);
+  const realHomeMtimeMs = homeStat?.mtimeMs ?? -1;
+  const realGeminiMtimeMs = geminiStat?.mtimeMs ?? -1;
+  const settingsMtimeMs = settingsStat?.mtimeMs ?? -1;
+  const cached = syncedProfiles.get(accountId);
+  const profileExists = Boolean(cliStat?.isDirectory());
+
+  if (
+    cached &&
+    profileExists &&
+    cached.realHomeMtimeMs === realHomeMtimeMs &&
+    cached.realGeminiMtimeMs === realGeminiMtimeMs
+  ) {
+    if (cached.settingsMtimeMs === settingsMtimeMs && cached.orchestratorKey === orchestratorKey) {
+      return home;
+    }
+    await syncSettings(cli, orchestratorOverride);
+    syncedProfiles.set(accountId, { realHomeMtimeMs, realGeminiMtimeMs, settingsMtimeMs, orchestratorKey });
+    return home;
+  }
+
   await ensureRealDir(profileRoot(accountId));
   await ensureRealDir(home);
   await mirror(REAL_HOME, home, (name) => name === ".gemini");
@@ -121,14 +167,16 @@ async function syncProfile(accountId: string, orchestratorOverride?: Orchestrato
     (name) => name === "antigravity-cli" || CREDENTIAL_NAME.test(name),
   );
 
-  const cli = profileCliDir(accountId);
   await ensureRealDir(cli);
-  for (const name of SHARED_CLI_DIRS) {
-    const target = path.join(REAL_CLI_DIR, name);
-    await fs.mkdir(target, { recursive: true });
-    await ensureLink(path.join(cli, name), target);
-  }
+  await Promise.all(
+    SHARED_CLI_DIRS.map(async (name) => {
+      const target = path.join(REAL_CLI_DIR, name);
+      await fs.mkdir(target, { recursive: true });
+      await ensureLink(path.join(cli, name), target);
+    }),
+  );
   await syncSettings(cli, orchestratorOverride);
+  syncedProfiles.set(accountId, { realHomeMtimeMs, realGeminiMtimeMs, settingsMtimeMs, orchestratorKey });
   return home;
 }
 
@@ -174,13 +222,25 @@ async function syncSettings(cli: string, orchestratorOverride?: OrchestratorChoi
   }
   if (body === null) {
     // No settings of its own: a stale copy must not keep an old choice alive.
+    lastSettingsBody.delete(target);
     await fs.rm(target, { force: true });
     return;
+  }
+  if (lastSettingsBody.get(target) === body) {
+    const stat = await fs.lstat(target).catch(() => null);
+    if (stat?.isFile()) return;
+  } else {
+    const existing = await fs.readFile(target, "utf8").catch(() => null);
+    if (existing === body) {
+      lastSettingsBody.set(target, body);
+      return;
+    }
   }
   const temp = `${target}.paseo-${process.pid}-${Date.now()}-${++settingsSeq}.tmp`;
   try {
     await fs.writeFile(temp, body, { mode: 0o600 });
     await fs.rename(temp, target);
+    lastSettingsBody.set(target, body);
   } catch (error) {
     await fs.rm(temp, { force: true }).catch(() => undefined);
     throw error;
@@ -465,6 +525,8 @@ export function removeProfile(accountId: string, label: string): Promise<Preserv
   return withLock(accountId, async () => {
     const home = profileHome(accountId);
     const cli = profileCliDir(accountId);
+    syncedProfiles.delete(accountId);
+    lastSettingsBody.delete(path.join(cli, "settings.json"));
     let folder: string | null = null;
     const moved: string[] = [];
     const movedSoFar = () => (folder ? ` Files moved so far are in ${displayPath(folder)}.` : "");

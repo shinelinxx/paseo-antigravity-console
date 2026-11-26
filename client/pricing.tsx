@@ -1,7 +1,7 @@
 import { useRpc, useTranslation } from "@getpaseo/plugin/client";
 import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { getPricingRpc, setPricingRpc, type PricingModelRow } from "../shared/contracts";
 import type { ModelRates } from "../shared/pricing";
@@ -84,7 +84,7 @@ function RateInput({
   );
 }
 
-function PricingRowEditor({
+const PricingRowEditor = memo(function PricingRowEditor({
   colors,
   row,
   initialExpanded,
@@ -292,6 +292,92 @@ function PricingRowEditor({
       ) : null}
     </View>
   );
+});
+
+function AddModelForm({
+  colors,
+  onAdd,
+  onCancel,
+}: {
+  colors: Colors;
+  onAdd(key: string, rates: ModelRates): Promise<void>;
+  onCancel(): void;
+}) {
+  const { t } = useTranslation(messages);
+  const [newKey, setNewKey] = useState("");
+  const [newInput, setNewInput] = useState("");
+  const [newCached, setNewCached] = useState("");
+  const [newOutput, setNewOutput] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addError, setAddError] = useState("");
+
+  async function submitNew() {
+    const key = newKey.trim().toLowerCase();
+    const input = parseRate(newInput);
+    const cached = parseRate(newCached);
+    const output = parseRate(newOutput);
+    if (!key) {
+      setAddError(t("pricing.invalidKey"));
+      return;
+    }
+    if (input === null || cached === null || output === null) {
+      setAddError(t("pricing.invalidRate"));
+      return;
+    }
+    setAddBusy(true);
+    setAddError("");
+    try {
+      await onAdd(key, { input, cached, output });
+    } catch (reason) {
+      setAddError(errorMessage(reason));
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  return (
+    <View style={{ gap: space.sm, padding: space.md, borderRadius: radius.md, backgroundColor: colors.surface1, borderWidth: 1, borderColor: colors.border }}>
+      <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>{t("pricing.addModel")}</Text>
+      <TextInput
+        accessibilityLabel={t("pricing.modelKeyPlaceholder")}
+        autoCapitalize="none"
+        autoCorrect={false}
+        value={newKey}
+        editable={!addBusy}
+        onChangeText={setNewKey}
+        placeholder={t("pricing.modelKeyPlaceholder")}
+        placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+        style={{
+          ...font.small,
+          fontFamily: mono,
+          color: colors.foreground,
+          backgroundColor: colors.surface0,
+          borderWidth: 1,
+          borderColor: colors.border,
+          borderRadius: radius.sm,
+          paddingHorizontal: space.sm,
+          paddingVertical: 6,
+        }}
+      />
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
+        <RateInput colors={colors} label={t("pricing.input")} value={newInput} editable={!addBusy} onChangeText={setNewInput} />
+        <RateInput colors={colors} label={t("pricing.cached")} value={newCached} editable={!addBusy} onChangeText={setNewCached} />
+        <RateInput colors={colors} label={t("pricing.output")} value={newOutput} editable={!addBusy} onChangeText={setNewOutput} />
+      </View>
+      {addError ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={addError} /> : null}
+      <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
+        <Button
+          colors={colors}
+          size="sm"
+          variant="ghost"
+          label={t("dialog.cancel")}
+          disabled={addBusy}
+          onPress={onCancel}
+        />
+        <Button colors={colors} size="sm" variant="primary" label={t("dialog.save")} loading={addBusy} onPress={() => void submitNew()} />
+      </View>
+    </View>
+  );
 }
 
 /** Modal for inspecting official Google/3P API prices and customizing rates per model. */
@@ -310,52 +396,30 @@ export function PricingDialog({
   const query = usePricing();
   const savePricing = useRpc(setPricingRpc);
   const [adding, setAdding] = useState(false);
-  const [newKey, setNewKey] = useState("");
-  const [newInput, setNewInput] = useState("");
-  const [newCached, setNewCached] = useState("");
-  const [newOutput, setNewOutput] = useState("");
-  const [addBusy, setAddBusy] = useState(false);
-  const [addError, setAddError] = useState("");
   const [resettingAll, setResettingAll] = useState(false);
 
   const models = query.data?.models ?? [];
   const hasAnyCustom = models.some((row) => row.custom !== null);
 
-  async function applyChange(payload: { key?: string; rates?: ModelRates | null; resetAll?: boolean }) {
-    const next = await savePricing(payload);
-    cache.setQueryData(PRICING_QUERY_KEY, next);
-    await cache.invalidateQueries({ queryKey: ["antigravity-accounts", "stats"] });
-  }
+  const applyChange = useCallback(
+    async (payload: { key?: string; rates?: ModelRates | null; resetAll?: boolean }) => {
+      const next = await savePricing(payload);
+      cache.setQueryData(PRICING_QUERY_KEY, next);
+      await cache.invalidateQueries({ queryKey: ["antigravity-accounts", "stats"] });
+    },
+    [savePricing, cache],
+  );
 
-  async function submitNew() {
-    const key = newKey.trim().toLowerCase();
-    const input = parseRate(newInput);
-    const cached = parseRate(newCached);
-    const output = parseRate(newOutput);
-    if (!key) {
-      setAddError(t("pricing.invalidKey"));
-      return;
-    }
-    if (input === null || cached === null || output === null) {
-      setAddError(t("pricing.invalidRate"));
-      return;
-    }
-    setAddBusy(true);
-    setAddError("");
-    try {
-      await applyChange({ key, rates: { input, cached, output } });
-      setNewKey("");
-      setNewInput("");
-      setNewCached("");
-      setNewOutput("");
+  const handleAddModel = useCallback(
+    async (key: string, rates: ModelRates) => {
+      await applyChange({ key, rates });
       setAdding(false);
       toast.show(t("pricing.saved"), { variant: "success" });
-    } catch (reason) {
-      setAddError(errorMessage(reason));
-    } finally {
-      setAddBusy(false);
-    }
-  }
+    },
+    [applyChange, toast, t],
+  );
+
+  const handleCancelAdd = useCallback(() => setAdding(false), []);
 
   return (
     <Modal open title={t("pricing.title")} onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -390,50 +454,7 @@ export function PricingDialog({
         <Divider colors={colors} />
 
         {adding ? (
-          <View style={{ gap: space.sm, padding: space.md, borderRadius: radius.md, backgroundColor: colors.surface1, borderWidth: 1, borderColor: colors.border }}>
-            <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>{t("pricing.addModel")}</Text>
-            <TextInput
-              accessibilityLabel={t("pricing.modelKeyPlaceholder")}
-              autoCapitalize="none"
-              autoCorrect={false}
-              value={newKey}
-              editable={!addBusy}
-              onChangeText={setNewKey}
-              placeholder={t("pricing.modelKeyPlaceholder")}
-              placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
-              style={{
-                ...font.small,
-                fontFamily: mono,
-                color: colors.foreground,
-                backgroundColor: colors.surface0,
-                borderWidth: 1,
-                borderColor: colors.border,
-                borderRadius: radius.sm,
-                paddingHorizontal: space.sm,
-                paddingVertical: 6,
-              }}
-            />
-            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
-              <RateInput colors={colors} label={t("pricing.input")} value={newInput} editable={!addBusy} onChangeText={setNewInput} />
-              <RateInput colors={colors} label={t("pricing.cached")} value={newCached} editable={!addBusy} onChangeText={setNewCached} />
-              <RateInput colors={colors} label={t("pricing.output")} value={newOutput} editable={!addBusy} onChangeText={setNewOutput} />
-            </View>
-            {addError ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={addError} /> : null}
-            <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
-              <Button
-                colors={colors}
-                size="sm"
-                variant="ghost"
-                label={t("dialog.cancel")}
-                disabled={addBusy}
-                onPress={() => {
-                  setAddError("");
-                  setAdding(false);
-                }}
-              />
-              <Button colors={colors} size="sm" variant="primary" label={t("dialog.save")} loading={addBusy} onPress={() => void submitNew()} />
-            </View>
-          </View>
+          <AddModelForm colors={colors} onAdd={handleAddModel} onCancel={handleCancelAdd} />
         ) : (
           <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
             <Button
@@ -442,10 +463,7 @@ export function PricingDialog({
               variant="secondary"
               icon="Plus"
               label={t("pricing.addModel")}
-              onPress={() => {
-                setAddError("");
-                setAdding(true);
-              }}
+              onPress={() => setAdding(true)}
             />
             {hasAnyCustom ? (
               <Button

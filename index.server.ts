@@ -59,7 +59,10 @@ export default function contribute(server: PluginServerContext) {
   }, 3000);
 
   // Keep quota fresh for the sidebar and clear past reset windows promptly.
+  let quotaRunning = false;
   const quotaTimer = setInterval(() => {
+    if (quotaRunning) return;
+    quotaRunning = true;
     void ready
       .then(async () => {
         const state = await service.state();
@@ -78,11 +81,25 @@ export default function contribute(server: PluginServerContext) {
         }
         await Promise.all([...due].map((id) => service.refreshOne(id)));
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        quotaRunning = false;
+      });
   }, 3 * 60_000);
+  quotaTimer.unref?.();
+
+  let sweepRunning = false;
   const sweepTimer = setInterval(() => {
-    void ready.then(() => service.refreshAll()).catch(() => undefined);
+    if (sweepRunning) return;
+    sweepRunning = true;
+    void ready
+      .then(() => service.refreshAll())
+      .catch(() => undefined)
+      .finally(() => {
+        sweepRunning = false;
+      });
   }, 15 * 60_000);
+  sweepTimer.unref?.();
 
   const fallback = new FallbackController(service, pending, orchestrator);
   const removers = registerHooks(server, service, pending, fallback, {

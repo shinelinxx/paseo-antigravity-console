@@ -1,5 +1,6 @@
 import { useTranslation } from "@getpaseo/plugin/client";
 import { Icon, Modal } from "@getpaseo/plugin/client/ui";
+import { memo } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
 import type { AccountSummary, QuotaBucket, QuotaGroup } from "../shared/contracts";
 import { percent, relative, upper } from "./format";
@@ -210,7 +211,7 @@ function Menu({
   );
 }
 
-export function AccountCard({
+export const AccountCard = memo(function AccountCard({
   account,
   colors,
   count,
@@ -421,4 +422,4 @@ export function AccountCard({
       ) : null}
     </Card>
   );
-}
+});

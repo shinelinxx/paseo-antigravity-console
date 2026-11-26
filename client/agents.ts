@@ -126,6 +126,10 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   const contextPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const accountPillSigs = new Map<string, string>();
+  const contextPillSigs = new Map<string, string>();
+  const subagentPillSigs = new Map<string, string>();
+  const orchestratorPillSigs = new Map<string, string>();
   const subagentCounts = new Map<string, { total: number; running: number }>();
   const scheduledSwitches = new Map<string, string>();
   const lastPolledAt = new Map<string, number>();
@@ -170,7 +174,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     listeners.forEach((listener) => listener());
   }
 
-  function publishWorkspaceSubagents() {
+  function publishWorkspaceSubagents(shouldEmit = true) {
     const next = new Map<string, number>();
     for (const agent of agents.values()) {
       if (!agent.workspace) continue;
@@ -184,7 +188,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       return;
     }
     workspaceSubagents = next;
-    emit();
+    if (shouldEmit) emit();
   }
 
   async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
@@ -262,13 +266,24 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     const currentLabel = current ? nameOf(current.label, current.kind) : agent.account;
     const currentQuota =
       current && healthy ? formatPoolQuota(poolQuotaInfo(current.quota, agent.model, now), client.i18n.locale) : null;
+    const label = currentQuota ? `${currentLabel} · ${currentQuota}` : currentLabel;
+    const choiceSig = choices
+      .map((entry) =>
+        entry.kind === "separator"
+          ? "-"
+          : `${entry.id}:${typeof entry.title === "string" ? entry.title : ""}:${typeof entry.icon === "string" ? entry.icon : ""}:${entry.disabled ? 1 : 0}`,
+      )
+      .join("|");
+    const sig = `${agent.workspace}|${healthy ? 1 : 0}|${agent.running ? 1 : 0}|${label}|${client.i18n.locale}|${choiceSig}`;
+    const pill = accountPills.get(agent.id);
+    if (pill && accountPillSigs.get(agent.id) === sig) return;
+    accountPillSigs.set(agent.id, sig);
     const button: PluginButton<PluginText> = {
       icon: healthy ? "UserRound" : "UserX",
       title: healthy ? messages.message("pill") : messages.message("pillSignedOut"),
-      label: currentQuota ? `${currentLabel} · ${currentQuota}` : currentLabel,
+      label,
       behavior: { kind: "menu", items: choices },
     };
-    const pill = accountPills.get(agent.id);
     if (pill) pill.update(button);
     else {
       accountPills.set(
@@ -294,17 +309,25 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (!agent.workspace || nativeContext.has(agent.id)) {
       contextPills.get(agent.id)?.remove();
       contextPills.delete(agent.id);
+      contextPillSigs.delete(agent.id);
       return;
     }
-    const button: PluginButton<PluginText> = {
-      icon: "Gauge",
-      title: messages.message("context.title"),
-      label: contextLabel(contextStore.get(agent.id)),
-      behavior: { kind: "popover", Content: ContextPopover },
-    };
+    const usage = contextStore.get(agent.id);
+    const sig = usage
+      ? `${agent.workspace}|${usage.used}|${usage.size ?? ""}|${client.i18n.locale}`
+      : `${agent.workspace}|empty|${client.i18n.locale}`;
     const pill = contextPills.get(agent.id);
-    if (pill) pill.update({ label: button.label });
+    if (pill && contextPillSigs.get(agent.id) === sig) return;
+    contextPillSigs.set(agent.id, sig);
+    const label = contextLabel(usage);
+    if (pill) pill.update({ label });
     else {
+      const button: PluginButton<PluginText> = {
+        icon: "Gauge",
+        title: messages.message("context.title"),
+        label,
+        behavior: { kind: "popover", Content: ContextPopover },
+      };
       contextPills.set(
         agent.id,
         client.addComposerPill({ id: "context", agentId: agent.id, workspaceId: agent.workspace, button }),
@@ -319,12 +342,16 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (!agent.workspace || !count?.total) {
       subagentPills.get(agent.id)?.remove();
       subagentPills.delete(agent.id);
+      subagentPillSigs.delete(agent.id);
       return;
     }
+    const sig = `${agent.workspace}|${count.running}|${count.total}`;
+    const pill = subagentPills.get(agent.id);
+    if (pill && subagentPillSigs.get(agent.id) === sig) return;
+    subagentPillSigs.set(agent.id, sig);
     const label = count.running
       ? messages.message("subagents.pillLabel", { running: count.running, total: count.total })
       : messages.message("subagents.pillLabelIdle", { total: count.total });
-    const pill = subagentPills.get(agent.id);
     if (pill) {
       pill.update({ label });
       return;
@@ -436,6 +463,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (!agent.workspace || !isOrchestratorModel(agent.model) || !orchestrator) {
       orchestratorPills.get(agent.id)?.remove();
       orchestratorPills.delete(agent.id);
+      orchestratorPillSigs.delete(agent.id);
       return;
     }
     const state = orchestrator;
@@ -451,6 +479,15 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     } else {
       label = messages.message("orchestrator.pillDefault");
     }
+
+    const familiesSig = (families: readonly ModelFamily[]) =>
+      families
+        .map((f) => `${f.id}:${f.accounts.includes(agent.account) ? 1 : 0}:${f.variants.map((v) => v.id).join(",")}`)
+        .join(";");
+    const sig = `${agent.workspace}|${agent.account}|${isOverride ? 1 : 0}|${savedPlanner ?? ""}|${savedExecutor ?? ""}|${effectivePlanner ?? ""}|${effectiveExecutor ?? ""}|${client.i18n.locale}|${familiesSig(state.planners)}|${familiesSig(state.executors)}`;
+    const pill = orchestratorPills.get(agent.id);
+    if (pill && orchestratorPillSigs.get(agent.id) === sig) return;
+    orchestratorPillSigs.set(agent.id, sig);
 
     const menuItems: PluginButtonMenuEntry<PluginText>[] = [
       {
@@ -483,7 +520,6 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       label,
       behavior: { kind: "menu", items: menuItems },
     };
-    const pill = orchestratorPills.get(agent.id);
     if (pill) pill.update(button);
     else {
       orchestratorPills.set(
@@ -525,21 +561,56 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
           client.rpc(contextUsageRpc, { agentIds: batch }),
           client.rpc(subagentCountsRpc, { agentIds: batch }).catch(() => null),
         ]);
+        const nativeSet = new Set(contextRes.native);
         for (const id of batch) {
           lastPolledAt.set(id, Date.now());
-          if (contextRes.native.includes(id)) nativeContext.add(id);
+          const prevNative = nativeContext.has(id);
+          const nextNative = nativeSet.has(id);
+          const nativeChanged = prevNative !== nextNative;
+          if (nextNative) nativeContext.add(id);
           else nativeContext.delete(id);
-          contextStore.set(id, contextRes.usage[id] ?? null);
+
+          const prevUsage = contextStore.get(id) ?? null;
+          const nextUsage = contextRes.usage[id] ?? null;
+          const usageChanged =
+            (prevUsage === null) !== (nextUsage === null) ||
+            (prevUsage !== null &&
+              nextUsage !== null &&
+              (prevUsage.used !== nextUsage.used ||
+                prevUsage.size !== nextUsage.size ||
+                prevUsage.input !== nextUsage.input ||
+                prevUsage.cached !== nextUsage.cached ||
+                prevUsage.output !== nextUsage.output ||
+                prevUsage.sizeSource !== nextUsage.sizeSource ||
+                prevUsage.updatedAt !== nextUsage.updatedAt ||
+                prevUsage.model !== nextUsage.model));
+          if (usageChanged) {
+            contextStore.set(id, nextUsage);
+          }
+
           // Only overwrite subagent counts when the RPC succeeded, avoiding flicker on transient failures.
+          let subagentChanged = false;
           if (subagentRes) {
+            const prevCount = subagentCounts.get(id);
             const found = subagentRes.counts[id];
-            if (found) subagentCounts.set(id, found);
-            else subagentCounts.delete(id);
+            if (found) {
+              if (!prevCount || prevCount.total !== found.total || prevCount.running !== found.running) {
+                subagentCounts.set(id, found);
+                subagentChanged = true;
+              }
+            } else if (prevCount) {
+              subagentCounts.delete(id);
+              subagentChanged = true;
+            }
           }
           const agent = agents.get(id);
           if (agent) {
-            renderContextPill(agent);
-            renderSubagentPill(agent);
+            if (nativeChanged || usageChanged || (!nextNative && !contextPills.has(id))) {
+              renderContextPill(agent);
+            }
+            if (subagentChanged) {
+              renderSubagentPill(agent);
+            }
           }
         }
       }
@@ -636,28 +707,33 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
     counts = nextCounts;
     memberSnapshot = nextMembers;
-    publishWorkspaceSubagents();
+    publishWorkspaceSubagents(false);
     emit();
   }
 
-  function remove(id: string) {
+  function remove(id: string): boolean {
+    const had = agents.delete(id);
     accountPills.get(id)?.remove();
     accountPills.delete(id);
+    accountPillSigs.delete(id);
     contextPills.get(id)?.remove();
     contextPills.delete(id);
+    contextPillSigs.delete(id);
     subagentPills.get(id)?.remove();
     subagentPills.delete(id);
+    subagentPillSigs.delete(id);
     orchestratorPills.get(id)?.remove();
     orchestratorPills.delete(id);
+    orchestratorPillSigs.delete(id);
     subagentCounts.delete(id);
     scheduledSwitches.delete(id);
     lastPolledAt.delete(id);
     nativeContext.delete(id);
     contextStore.delete(id);
-    agents.delete(id);
+    return had;
   }
 
-  function upsert(row: AgentRow) {
+  function upsert(row: AgentRow): boolean {
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
     const member: ObservedAgent = {
       id: row.id,
@@ -684,7 +760,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       old.model === member.model &&
       old.title === member.title
     ) {
-      return;
+      return false;
     }
     if (old && old.workspace !== member.workspace) remove(row.id);
     agents.set(row.id, member);
@@ -692,6 +768,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     renderContextPill(member);
     renderSubagentPill(member);
     renderOrchestratorPill(member);
+    return true;
   }
 
   let reconnect: Timer | undefined;
@@ -702,17 +779,21 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       subscription.subscribe({
         snapshot({ entries }) {
           if (lifetime.signal.aborted) return;
+          let changed = false;
           const ids = new Set(entries.map(({ agent }) => agent.id));
-          for (const id of agents.keys()) if (!ids.has(id)) remove(id);
-          entries.forEach(({ agent }) => upsert(agent));
-          publishAgents();
+          for (const id of agents.keys()) {
+            if (!ids.has(id) && remove(id)) changed = true;
+          }
+          for (const { agent } of entries) {
+            if (upsert(agent)) changed = true;
+          }
+          if (changed || counts === null) publishAgents();
         },
         update(message) {
           if (lifetime.signal.aborted || message.type !== "agent_update") return;
           const update = message.payload;
-          if (update.kind === "remove") remove(update.agentId);
-          else upsert(update.agent);
-          publishAgents();
+          const changed = update.kind === "remove" ? remove(update.agentId) : upsert(update.agent);
+          if (changed) publishAgents();
         },
       });
     } catch (error) {
@@ -891,6 +972,10 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       contextPills.clear();
       subagentPills.clear();
       orchestratorPills.clear();
+      accountPillSigs.clear();
+      contextPillSigs.clear();
+      subagentPillSigs.clear();
+      orchestratorPillSigs.clear();
       subagentCounts.clear();
       scheduledSwitches.clear();
       lastPolledAt.clear();

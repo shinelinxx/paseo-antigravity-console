@@ -17,6 +17,7 @@ import { SUBAGENT_PANEL_ID, createSubagentViews } from "./client/subagents";
 import { AskQuestionRow } from "./client/questions";
 import { FallbackNote } from "./client/timeline";
 import { registerSubagentTransforms } from "./client/transform";
+import { AccountsClientContext } from "./client/useAccounts";
 import {
   ASK_QUESTION_TIMELINE_KIND,
   FALLBACK_TIMELINE_KIND,
@@ -39,15 +40,27 @@ export default function contribute(client: PluginClientContext) {
 
   function Screen(props: PluginSurfaceProps) {
     observation.useNotifications();
-    return <AccountsScreen {...props} observation={observation} />;
+    return (
+      <AccountsClientContext.Provider value={client}>
+        <AccountsScreen {...props} observation={observation} />
+      </AccountsClientContext.Provider>
+    );
   }
   function Sidebar(props: PluginSidebarItemProps) {
     observation.useNotifications();
-    return <QuotaSidebarItem {...props} />;
+    return (
+      <AccountsClientContext.Provider value={client}>
+        <QuotaSidebarItem {...props} />
+      </AccountsClientContext.Provider>
+    );
   }
   function Composer() {
     observation.useNotifications();
-    return <ComposerAccount />;
+    return (
+      <AccountsClientContext.Provider value={client}>
+        <ComposerAccount />
+      </AccountsClientContext.Provider>
+    );
   }
   function SubagentsWorkspaceBadge({ workspaceId }: PluginWorkspaceRowBadgeItemProps) {
     const { t } = useTranslation(messages);

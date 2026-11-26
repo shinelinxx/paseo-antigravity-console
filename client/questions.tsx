@@ -7,8 +7,8 @@ import {
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
 import { Icon, Markdown, TextInput, useToast } from "@getpaseo/plugin/client/ui";
-import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { isAntigravityProvider, type AskQuestionCard, type AskQuestionEntry } from "../shared/contracts";
 import { errorMessage, messages } from "./messages";
@@ -28,6 +28,11 @@ import { Badge, Card } from "./ui";
 
 type PressState = { pressed: boolean; hovered?: boolean };
 type Layout = PluginSurfaceProps["layout"];
+
+const EMPTY_SET: ReadonlySet<number> = new Set();
+const SETTLED_RESOLUTION: Exclude<QuestionResolution, { state: "pending" } | { state: "loading" }> = {
+  state: "settled",
+};
 
 /** Optimistic client-side memory of answers submitted from this session so the card settles immediately. */
 const submittedByKey = new Map<string, QuestionResolution>();
@@ -182,9 +187,9 @@ function PendingQuestionForm({
 
   const safeIndex = Math.min(activeIndex, questions.length - 1);
   const current = questions[safeIndex]!;
-  const currentSelected = selections[safeIndex] ?? new Set<number>();
+  const currentSelected = selections[safeIndex] ?? EMPTY_SET;
   const currentCustom = customTexts[safeIndex] ?? "";
-  const parsedOptions = current.options.map(parseOption);
+  const parsedOptions = useMemo(() => current.options.map(parseOption), [current.options]);
 
   const currentAnswered = isQuestionAnswered(current, selections[safeIndex], customTexts[safeIndex]);
   const firstUnanswered = questions.findIndex(
@@ -590,11 +595,29 @@ function PendingQuestionForm({
   );
 }
 
-export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: PluginTimelineItemProps<AskQuestionCard>) {
-  const { colors } = theme;
+function LiveQuestionResolver({
+  agentId,
+  callId,
+  cacheKey,
+  callStatus,
+  questions,
+  colors,
+  layout,
+  timestamp,
+  onSettled,
+}: {
+  agentId: string;
+  callId: string;
+  cacheKey: string;
+  callStatus: AskQuestionCard["status"];
+  questions: readonly AskQuestionEntry[];
+  colors: Colors;
+  layout: Layout;
+  timestamp: Date;
+  onSettled(next: QuestionResolution): void;
+}) {
   const paseo = usePaseo();
-  const { callId, questions, output, status: callStatus } = item.data;
-  const cacheKey = `${agentId}:${callId}`;
+  const queryClient = useQueryClient();
 
   const agentState = useAgent(
     agentId,
@@ -603,26 +626,8 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
   const [provider = "", agentStatus = "", lastActivityAt = ""] = (agentState ?? "").split("|");
   const antigravity = !provider || isAntigravityProvider(provider);
 
-  const [trackedKey, setTrackedKey] = useState(cacheKey);
-  const [localResolution, setLocalResolution] = useState<QuestionResolution | null>(
-    () => submittedByKey.get(cacheKey) ?? null,
-  );
-  if (trackedKey !== cacheKey) {
-    setTrackedKey(cacheKey);
-    setLocalResolution(submittedByKey.get(cacheKey) ?? null);
-  }
-
-  const outputResolution = useMemo(() => resolutionFromToolOutput(questions, output), [questions, output]);
   const echoSignature = useMemo(() => formatQuestionEcho(questions), [questions]);
-
-  const effectiveResolution = trackedKey === cacheKey ? localResolution : (submittedByKey.get(cacheKey) ?? null);
-  const needsTimelineCheck =
-    antigravity &&
-    !effectiveResolution &&
-    !outputResolution &&
-    callStatus !== "failed" &&
-    callStatus !== "canceled";
-
+  const needsTimelineCheck = antigravity && agentStatus !== "closed";
   const allowStreamingEcho = agentStatus === "running" || callStatus === "running";
 
   const timelineQuery = useQuery({
@@ -656,12 +661,31 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
     },
   });
 
-  const { refetch: refetchTimeline, dataUpdatedAt, isFetching } = timelineQuery;
+  const { dataUpdatedAt, isFetching } = timelineQuery;
+  const dataUpdatedAtRef = useRef(dataUpdatedAt);
+  dataUpdatedAtRef.current = dataUpdatedAt;
+  const invalidateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const prevActivityRef = useRef(lastActivityAt);
+
   useEffect(() => {
-    if (needsTimelineCheck && lastActivityAt) {
-      void refetchTimeline();
-    }
-  }, [needsTimelineCheck, lastActivityAt, refetchTimeline]);
+    return () => {
+      if (invalidateTimerRef.current) {
+        clearTimeout(invalidateTimerRef.current);
+        invalidateTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!needsTimelineCheck || !lastActivityAt || lastActivityAt === prevActivityRef.current) return;
+    prevActivityRef.current = lastActivityAt;
+    if (invalidateTimerRef.current) return;
+    const waitMs = Math.max(150, 1000 - (Date.now() - dataUpdatedAtRef.current));
+    invalidateTimerRef.current = setTimeout(() => {
+      invalidateTimerRef.current = null;
+      void queryClient.invalidateQueries({ queryKey: ["antigravity-accounts", "ask-question", agentId] });
+    }, waitMs);
+  }, [needsTimelineCheck, lastActivityAt, queryClient, agentId]);
 
   useEffect(() => {
     if (!needsTimelineCheck || !timelineQuery.data) return;
@@ -669,16 +693,19 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
     );
     if (!present && dataUpdatedAt <= timestamp.getTime() + 1500) {
-      void refetchTimeline();
+      if (!invalidateTimerRef.current) {
+        const waitMs = Math.max(150, 1000 - (Date.now() - dataUpdatedAtRef.current));
+        invalidateTimerRef.current = setTimeout(() => {
+          invalidateTimerRef.current = null;
+          void queryClient.invalidateQueries({ queryKey: ["antigravity-accounts", "ask-question", agentId] });
+        }, waitMs);
+      }
     }
-  }, [needsTimelineCheck, timelineQuery.data, dataUpdatedAt, timestamp, callId, refetchTimeline]);
+  }, [needsTimelineCheck, timelineQuery.data, dataUpdatedAt, timestamp, callId, queryClient, agentId]);
 
   const resolved: QuestionResolution = useMemo(() => {
-    if (effectiveResolution) return effectiveResolution;
-    if (outputResolution) return outputResolution;
-    if (!antigravity) return { state: "settled" };
-    if (callStatus === "failed" || callStatus === "canceled") return { state: "settled" };
-    if (agentStatus === "closed") return { state: "settled" };
+    if (!antigravity) return SETTLED_RESOLUTION;
+    if (agentStatus === "closed") return SETTLED_RESOLUTION;
 
     const data = timelineQuery.data;
     if (!data) {
@@ -688,7 +715,7 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       const hasLaterActivity =
         Number.isFinite(itemTime) && Number.isFinite(latestTime) && latestTime - itemTime > 12_000;
       if (hasLaterActivity) {
-        return timelineQuery.isError ? { state: "settled" } : { state: "loading" };
+        return timelineQuery.isError ? SETTLED_RESOLUTION : { state: "loading" };
       }
       return { state: "pending" };
     }
@@ -701,7 +728,7 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       const recent =
         isFetching || Date.now() - timestamp.getTime() < 20_000 || dataUpdatedAt <= timestamp.getTime() + 1500;
       if (recent) return { state: "pending" };
-      return data.hasOlder ? { state: "settled" } : { state: "pending" };
+      return data.hasOlder ? SETTLED_RESOLUTION : { state: "pending" };
     }
 
     for (let cursor = index + 1; cursor < entries.length; cursor += 1) {
@@ -713,13 +740,11 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
         continue;
       }
       if (callStatus !== "running" && (next.type === "tool_call" || next.type === "reasoning" || next.type === "assistant_message")) {
-        return { state: "settled" };
+        return SETTLED_RESOLUTION;
       }
     }
     return { state: "pending" };
   }, [
-    effectiveResolution,
-    outputResolution,
     antigravity,
     callStatus,
     agentStatus,
@@ -735,19 +760,13 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
     echoSignature,
   ]);
 
-  // Cache terminal timeline resolutions so historical cards stop polling on later streaming turns.
+  // Cache terminal timeline resolutions so historical cards stop subscribing & polling on later streaming turns.
   useEffect(() => {
-    if (
-      !effectiveResolution &&
-      !outputResolution &&
-      (resolved.state === "answered" || resolved.state === "skipped" || resolved.state === "settled")
-    ) {
+    if (resolved.state === "answered" || resolved.state === "skipped" || resolved.state === "settled") {
       rememberSubmitted(cacheKey, resolved);
-      setLocalResolution(resolved);
+      onSettled(resolved);
     }
-  }, [cacheKey, effectiveResolution, outputResolution, resolved]);
-
-  if (questions.length === 0) return null;
+  }, [cacheKey, resolved, onSettled]);
 
   if (resolved.state === "loading") {
     return (
@@ -774,7 +793,56 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
       colors={colors}
       layout={layout}
       questions={questions}
-      onResolved={setLocalResolution}
+      onResolved={onSettled}
     />
   );
 }
+
+export const AskQuestionRow = memo(function AskQuestionRow({
+  agentId,
+  item,
+  theme,
+  layout,
+  timestamp,
+}: PluginTimelineItemProps<AskQuestionCard>) {
+  const { colors } = theme;
+  const { callId, questions, output, status: callStatus } = item.data;
+  const cacheKey = `${agentId}:${callId}`;
+
+  const [trackedKey, setTrackedKey] = useState(cacheKey);
+  const [localResolution, setLocalResolution] = useState<QuestionResolution | null>(
+    () => submittedByKey.get(cacheKey) ?? null,
+  );
+  if (trackedKey !== cacheKey) {
+    setTrackedKey(cacheKey);
+    setLocalResolution(submittedByKey.get(cacheKey) ?? null);
+  }
+
+  const outputResolution = useMemo(() => resolutionFromToolOutput(questions, output), [questions, output]);
+  const effectiveResolution = trackedKey === cacheKey ? localResolution : (submittedByKey.get(cacheKey) ?? null);
+
+  if (questions.length === 0) return null;
+
+  const immediate =
+    effectiveResolution ??
+    outputResolution ??
+    (callStatus === "failed" || callStatus === "canceled" ? SETTLED_RESOLUTION : null);
+
+  if (immediate && immediate.state !== "pending" && immediate.state !== "loading") {
+    return <SettledQuestionCard colors={colors} questions={questions} resolution={immediate} />;
+  }
+
+  return (
+    <LiveQuestionResolver
+      agentId={agentId}
+      callId={callId}
+      cacheKey={cacheKey}
+      callStatus={callStatus}
+      questions={questions}
+      colors={colors}
+      layout={layout}
+      timestamp={timestamp}
+      onSettled={setLocalResolution}
+    />
+  );
+});

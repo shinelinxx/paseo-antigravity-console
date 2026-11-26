@@ -12,6 +12,7 @@ import { useAccounts } from "./useAccounts";
 // Geometry follows the other footer rows (host status, built-in usage summary).
 const FONT_SIZE = 12;
 const ICON_SIZE = 14;
+const SIDEBAR_LOGO = { svg: antigravityLogoSvg("sidebar") };
 
 /** The quota group the sidebar summarizes: Gemini when present, else the first group. */
 function primaryGroup(groups: readonly QuotaGroup[]): QuotaGroup | null {
@@ -98,7 +99,7 @@ export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSid
       {accountUnhealthy ? (
         <Icon name="AlertTriangle" size={ICON_SIZE} color={colors.statusWarning} />
       ) : (
-        <Icon icon={{ svg: antigravityLogoSvg("sidebar") }} size={ICON_SIZE} color={colors.foregroundMuted} />
+        <Icon icon={SIDEBAR_LOGO} size={ICON_SIZE} color={colors.foregroundMuted} />
       )}
       {!hideFiveHour ? <Meter colors={colors} label="5H" bucket={fiveHour} locale={locale} /> : null}
       {!hideWeekly ? <Meter colors={colors} label="7D" bucket={weekly} locale={locale} /> : null}

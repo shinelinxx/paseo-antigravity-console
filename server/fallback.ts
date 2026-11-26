@@ -407,12 +407,13 @@ export class FallbackController {
   ): Promise<string | null> {
     const pool = quotaPoolForModel(model);
     const state = await this.service.state();
+    const byId = new Map(state.accounts.map((account) => [account.id, account]));
     const ids = state.accounts.map((account) => account.id);
     const start = Math.max(0, ids.indexOf(current));
     const ordered: AccountSummary[] = [];
     for (let step = 1; step < ids.length; step += 1) {
       const id = ids[(start + step) % ids.length]!;
-      const account = state.accounts.find((entry) => entry.id === id);
+      const account = byId.get(id);
       if (account) ordered.push(account);
     }
 
@@ -425,14 +426,18 @@ export class FallbackController {
       if (this.activeCooldown(id, pool)) continue;
       if (!account.usable || account.status === "signed-out") continue;
       if (this.models?.supportsModel(id, model) === false) continue;
+      let refreshed = false;
       if (account.status === "unknown" || hasExpiredReset(this.service.knownQuota(id))) {
         // Never checked or past a quota reset window: refresh once before evaluating.
         await this.service.refreshOne(id).catch(() => undefined);
+        refreshed = true;
       }
       const known = this.service.knownQuota(id);
       if (exhausted(known, pool)) continue;
-      const fresh = (await this.service.state()).accounts.find((entry) => entry.id === id);
-      if (!fresh || fresh.status === "signed-out" || !fresh.usable || !fresh.fallbackEnabled) continue;
+      if (refreshed) {
+        const fresh = (await this.service.state()).accounts.find((entry) => entry.id === id);
+        if (!fresh || fresh.status === "signed-out" || !fresh.usable || !fresh.fallbackEnabled) continue;
+      }
       if (id !== SYSTEM_ACCOUNT_ID && !(await this.service.hasSignInFile(id))) continue;
       const supported = this.models?.ensureModelSupport
         ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
