@@ -15,6 +15,7 @@ import {
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
 import { switchAgentAccount, type PendingSwitches } from "./hooks";
+import { computeEffectiveWeight, evaluatePoolQuota } from "./router";
 import type { PaseoApi } from "./types";
 
 export type FailureKind = FallbackEvent["reason"];
@@ -181,6 +182,11 @@ export class FallbackController {
     }
     if (!entry.all && !entry.gemini && !entry["third-party"]) this.cooldowns.delete(accountId);
     return active;
+  }
+
+  /** True when the account is currently cooling down for `pool` (or globally). */
+  isCooling(accountId: string, pool: "gemini" | "third-party"): boolean {
+    return this.activeCooldown(accountId, pool) !== null;
   }
 
   private activeCooldown(accountId: string, pool: "gemini" | "third-party"): CooldownEntry | null {
@@ -417,7 +423,13 @@ export class FallbackController {
       if (account) ordered.push(account);
     }
 
-    const candidates: Array<{ id: string; orderIndex: number; score: number; soonestReset: number }> = [];
+    const candidates: Array<{
+      id: string;
+      orderIndex: number;
+      score: number;
+      weightedScore: number;
+      soonestReset: number;
+    }> = [];
     for (let index = 0; index < ordered.length; index += 1) {
       const account = ordered[index]!;
       const id = account.id;
@@ -443,10 +455,15 @@ export class FallbackController {
         ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
         : (this.models?.supportsModel(id, model) ?? null);
       if (supported === false) continue;
+      const metrics = evaluatePoolQuota(known, pool);
       candidates.push({
         id,
         orderIndex: index,
         score: poolRemainingScore(known, pool),
+        weightedScore: computeEffectiveWeight({
+          baseWeight: account.effectiveWeight > 0 ? account.effectiveWeight : 0.01,
+          metrics,
+        }),
         soonestReset: poolSoonestReset(known, pool),
       });
     }
@@ -454,6 +471,8 @@ export class FallbackController {
     if (!candidates.length) return null;
     if (strategy === "quota") {
       candidates.sort((a, b) => b.score - a.score || a.orderIndex - b.orderIndex);
+    } else if (strategy === "weighted") {
+      candidates.sort((a, b) => b.weightedScore - a.weightedScore || b.score - a.score || a.orderIndex - b.orderIndex);
     } else if (strategy === "reset") {
       candidates.sort((a, b) => a.soonestReset - b.soonestReset || b.score - a.score || a.orderIndex - b.orderIndex);
     }

@@ -2,7 +2,7 @@ import { useTranslation } from "@getpaseo/plugin/client";
 import { Icon, Modal } from "@getpaseo/plugin/client/ui";
 import { memo } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import type { AccountSummary, QuotaBucket, QuotaGroup } from "../shared/contracts";
+import type { AccountSummary, QuotaBucket, QuotaGroup, RoutingMode } from "../shared/contracts";
 import { percent, relative, upper } from "./format";
 import { displayLabel } from "./labels";
 import { antigravityLogoSvg } from "./logo";
@@ -17,6 +17,7 @@ export type CardAction =
   | "moveUp"
   | "moveDown"
   | "toggleFallback"
+  | "setWeight"
   | "clearCooldown"
   | "orchestratorOverride"
   | "recoverFiles"
@@ -24,6 +25,10 @@ export type CardAction =
   | "signIn"
   | "signOut"
   | "remove";
+
+function formatWeight(weight: number): string {
+  return Number.isInteger(weight) ? String(weight) : String(Number(weight.toFixed(2)));
+}
 
 function statusTone(account: AccountSummary): Tone {
   if (!account.usable) return "warning";
@@ -215,6 +220,7 @@ export const AccountCard = memo(function AccountCard({
   account,
   colors,
   count,
+  routingMode = "default",
   now,
   busy,
   compact,
@@ -227,6 +233,7 @@ export const AccountCard = memo(function AccountCard({
   account: AccountSummary;
   colors: Colors;
   count: number | undefined;
+  routingMode?: RoutingMode;
   now: number;
   busy: CardAction | null;
   compact: boolean;
@@ -258,6 +265,7 @@ export const AccountCard = memo(function AccountCard({
     label: account.fallbackEnabled ? t("action.disableFallback") : t("action.enableFallback"),
     icon: account.fallbackEnabled ? "ShieldOff" : "ShieldCheck",
   });
+  menuItems.push({ id: "setWeight", label: t("action.setWeight"), icon: "Gauge" });
   if (activeCooldowns.length > 0) {
     menuItems.push({ id: "clearCooldown", label: t("action.clearCooldown"), icon: "Play" });
   }
@@ -306,6 +314,27 @@ export const AccountCard = memo(function AccountCard({
           {account.plan ? <Badge colors={colors} label={account.plan} icon="Sparkles" /> : null}
           <Badge colors={colors} label={t(`kind.${account.kind}`)} icon={isProfile ? "UserRound" : "KeyRound"} />
           {!account.fallbackEnabled ? <Badge colors={colors} label={t("badgeNoFallback")} icon="ShieldOff" /> : null}
+          {routingMode !== "default" || account.weight !== null ? (
+            <Pressable accessibilityRole="button" onPress={() => onAction("setWeight")}>
+              <Badge
+                colors={colors}
+                label={
+                  account.effectiveWeight <= 0
+                    ? t("badgeWeightOff")
+                    : account.routingShare !== null && routingMode !== "default"
+                      ? t("badgeWeightWithShare", {
+                          weight: formatWeight(account.effectiveWeight),
+                          share: percent(account.routingShare, locale),
+                        })
+                      : account.weight === null
+                        ? t("badgeWeightAuto", { weight: formatWeight(account.effectiveWeight) })
+                        : t("badgeWeightCustom", { weight: formatWeight(account.effectiveWeight) })
+                }
+                tone={account.effectiveWeight <= 0 ? "neutral" : account.weight !== null ? "accent" : "neutral"}
+                icon="Gauge"
+              />
+            </Pressable>
+          ) : null}
           {account.orchestratorOverride ? (
             <Pressable accessibilityRole="button" onPress={() => onAction("orchestratorOverride")}>
               <Badge colors={colors} label={t("badgeCustomOrchestrator")} tone="accent" icon="Workflow" />

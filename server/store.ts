@@ -4,8 +4,10 @@ import path from "node:path";
 import { z } from "zod";
 import {
   SYSTEM_ACCOUNT_ID,
+  accountWeightSchema,
   fallbackStrategySchema,
   orchestratorChoiceSchema,
+  routingModeSchema,
 } from "../shared/contracts";
 import { storeFile } from "./paths";
 
@@ -20,6 +22,8 @@ const storedAccountSchema = z.object({
   unsafeDetail: z.string().nullable().default(null),
   /** Whether automatic fallback may switch turns onto this account. */
   fallbackEnabled: z.boolean().default(true),
+  /** Custom load-balancing weight; null infers from the Google AI plan (Ultra=20, Pro=1). */
+  weight: accountWeightSchema.nullable().default(null),
   /** Per-account Orchestrator override; null inherits the global settings.json choice. */
   orchestrator: orchestratorChoiceSchema.nullable().default(null),
 });
@@ -30,6 +34,7 @@ const storeSchema = z.object({
   systemLabel: z.string().default("System sign-in"),
   systemEmail: z.string().nullable().default(null),
   systemFallbackEnabled: z.boolean().default(true),
+  systemWeight: accountWeightSchema.nullable().default(null),
   /** Explicit display & fallback priority order of account ids (including "default"). */
   order: z.array(z.string()).default([]),
   accounts: z.array(storedAccountSchema).default([]),
@@ -40,6 +45,12 @@ const storeSchema = z.object({
       strategy: fallbackStrategySchema.default("order"),
     })
     .default({ enabled: true, retries: 2, strategy: "order" }),
+  routing: z
+    .object({
+      mode: routingModeSchema.default("default"),
+      reservePercent: z.number().int().min(0).max(50).default(10),
+    })
+    .default({ mode: "default", reservePercent: 10 }),
 });
 
 export type StoredAccount = z.infer<typeof storedAccountSchema>;

@@ -2,12 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   SYSTEM_ACCOUNT_ID,
+  inferPlanWeight,
   type AccountCooldown,
   type AccountSummary,
   type AccountsState,
   type FallbackSettings,
   type OrchestratorChoice,
   type QuotaGroup,
+  type RoutingSettings,
   type SavedFiles,
 } from "../shared/contracts";
 import { agyVersion, probeAccount, readAccountEmail, readPlan, type AccountPlan } from "./agy";
@@ -22,6 +24,7 @@ import {
   savedFiles,
   scanAfterSignIn,
 } from "./profile";
+import { computeRoutingShares } from "./router";
 import { SignInManager } from "./signin";
 import { AccountStore, orderedAccountIds, type StoredAccount } from "./store";
 
@@ -83,6 +86,7 @@ export class AccountService {
   private readonly listeners = new Set<(revision: number) => void>();
   private readonly statusListeners = new Set<(event: StatusUpdateEvent) => void>();
   private cooldownProvider: (accountId: string) => AccountCooldown[] = () => [];
+  private runningCountProvider: () => ReadonlyMap<string, number> = () => new Map();
   /** Starts from the clock so it keeps increasing across daemon and plugin restarts. */
   private revision = Date.now();
   private agyPath: string | null = null;
@@ -186,6 +190,10 @@ export class AccountService {
 
   setCooldownProvider(provider: (accountId: string) => AccountCooldown[]): void {
     this.cooldownProvider = provider;
+  }
+
+  setRunningCountProvider(provider: () => ReadonlyMap<string, number>): void {
+    this.runningCountProvider = provider;
   }
 
   onChange(listener: (revision: number) => void): () => void {
@@ -438,12 +446,19 @@ export class AccountService {
     return this.runtime.get(accountId)?.status ?? "unknown";
   }
 
-  /** Last known quota, probing first when nothing is known yet. */
+  /** Last known quota; returns cached status immediately (refreshing in background if stale) and only blocks when nothing is known yet. */
   async quotaFor(accountId: string, maxAgeMs: number): Promise<RuntimeStatus> {
     const current = this.runtime.get(accountId);
     const age = current?.checkedAt ? Date.now() - Date.parse(current.checkedAt) : Infinity;
-    if (!current || age > maxAgeMs) await this.refreshOne(accountId);
-    return this.runtime.get(accountId) ?? UNKNOWN;
+    const hasKnown = Boolean(current && (current.status === "signed-in" || current.status === "signed-out"));
+    if (!hasKnown) {
+      await this.refreshOne(accountId);
+      return this.runtime.get(accountId) ?? UNKNOWN;
+    }
+    if (age > maxAgeMs) {
+      void this.refreshOne(accountId).catch(() => undefined);
+    }
+    return current!;
   }
 
   async state(): Promise<AccountsState> {
@@ -472,6 +487,9 @@ export class AccountService {
       createdAt: null,
       usable: true,
       fallbackEnabled: data.systemFallbackEnabled,
+      weight: data.systemWeight,
+      effectiveWeight: data.systemWeight ?? inferPlanWeight(system.plan?.name, system.plan?.id),
+      routingShare: null,
       cooldowns: this.cooldownProvider(SYSTEM_ACCOUNT_ID),
       orchestratorOverride: null,
     });
@@ -492,6 +510,9 @@ export class AccountService {
         createdAt: account.createdAt,
         usable: account.unsafeDetail === null,
         fallbackEnabled: account.fallbackEnabled,
+        weight: account.weight,
+        effectiveWeight: account.weight ?? inferPlanWeight(status.plan?.name, status.plan?.id),
+        routingShare: null,
         cooldowns: this.cooldownProvider(account.id),
         orchestratorOverride: account.orchestrator,
       });
@@ -501,6 +522,19 @@ export class AccountService {
       .map((id) => byId.get(id))
       .filter((entry): entry is AccountSummary => Boolean(entry));
 
+    if (data.routing.mode !== "default") {
+      const shares = computeRoutingShares(
+        accounts,
+        data.routing.mode,
+        data.routing.reservePercent,
+        "gemini",
+        this.runningCountProvider(),
+      );
+      for (const account of accounts) {
+        account.routingShare = shares.get(account.id) ?? null;
+      }
+    }
+
     return {
       accounts,
       defaultAccountId,
@@ -508,6 +542,7 @@ export class AccountService {
       agyVersion: this.agyVersionValue,
       problems,
       fallback: { ...data.fallback },
+      routing: { ...data.routing },
       revision: this.revision,
     };
   }
@@ -519,6 +554,17 @@ export class AccountService {
   async setFallback(patch: Partial<FallbackSettings>): Promise<void> {
     await this.store.update((data) => {
       data.fallback = { ...data.fallback, ...patch };
+    });
+    this.changed();
+  }
+
+  routingSettings(): RoutingSettings {
+    return { ...this.store.readonlyData().routing };
+  }
+
+  async setRouting(patch: Partial<RoutingSettings>): Promise<void> {
+    await this.store.update((data) => {
+      data.routing = { ...data.routing, ...patch };
     });
     this.changed();
   }
@@ -544,6 +590,7 @@ export class AccountService {
         credentialFiles: [],
         unsafeDetail: null,
         fallbackEnabled: true,
+        weight: null,
         orchestrator: null,
       });
       const order = orderedAccountIds(data);
@@ -588,7 +635,7 @@ export class AccountService {
 
   async setAccountOptions(
     accountId: string,
-    patch: { fallbackEnabled?: boolean; orchestratorOverride?: OrchestratorChoice | null },
+    patch: { fallbackEnabled?: boolean; weight?: number | null; orchestratorOverride?: OrchestratorChoice | null },
   ): Promise<void> {
     this.requireAccount(accountId);
     if (accountId === SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {
@@ -597,11 +644,13 @@ export class AccountService {
     await this.store.update((data) => {
       if (accountId === SYSTEM_ACCOUNT_ID) {
         if (patch.fallbackEnabled !== undefined) data.systemFallbackEnabled = patch.fallbackEnabled;
+        if (patch.weight !== undefined) data.systemWeight = patch.weight;
         return;
       }
       const entry = data.accounts.find((candidate) => candidate.id === accountId);
       if (!entry) return;
       if (patch.fallbackEnabled !== undefined) entry.fallbackEnabled = patch.fallbackEnabled;
+      if (patch.weight !== undefined) entry.weight = patch.weight;
       if (patch.orchestratorOverride !== undefined) entry.orchestrator = patch.orchestratorOverride;
     });
     if (accountId !== SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {

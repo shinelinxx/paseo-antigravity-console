@@ -13,6 +13,9 @@ export const ACCOUNT_METADATA_KEY = "antigravity-accounts.account";
 /** Id of the system sign-in (the keychain login `agy` uses without this plugin). */
 export const SYSTEM_ACCOUNT_ID = "default";
 
+/** Draft composer metadata sentinel meaning "let load balancing pick an account on creation". */
+export const AUTO_ACCOUNT_ID = "__auto__";
+
 /** Synthetic account id used in usage analytics for requests without an observed account turn. */
 export const UNATTRIBUTED_ACCOUNT_ID = "unattributed";
 
@@ -25,7 +28,16 @@ export function isAntigravityProvider(provider: string | null | undefined): bool
 /** Reads the account id stored on an agent; returns SYSTEM_ACCOUNT_ID when none is stored. */
 export function accountIdFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined): string {
   const value = metadata?.[ACCOUNT_METADATA_KEY];
-  return typeof value === "string" && value.length > 0 ? value : SYSTEM_ACCOUNT_ID;
+  return typeof value === "string" && value.length > 0 && value !== AUTO_ACCOUNT_ID ? value : SYSTEM_ACCOUNT_ID;
+}
+
+/** Infers the default load-balancing weight from an account's Google AI plan (Ultra 20x : Pro 1x). */
+export function inferPlanWeight(plan: string | null | undefined, planId?: string | null): number {
+  const combined = `${planId ?? ""} ${plan ?? ""}`.toLowerCase();
+  if (/ultra/.test(combined)) return 20;
+  if (/\bpro\b|pro-tier/.test(combined)) return 1;
+  if (/\bfree\b|standard|basic/.test(combined)) return 0.25;
+  return 1;
 }
 
 /** Quota pool a model draws from. */
@@ -93,6 +105,8 @@ export const orchestratorChoiceSchema = z.object({
 });
 export type OrchestratorChoice = z.infer<typeof orchestratorChoiceSchema>;
 
+export const accountWeightSchema = z.number().finite().min(0).max(100);
+
 export const accountSummarySchema = z.object({
   id: accountIdSchema,
   label: z.string(),
@@ -116,6 +130,12 @@ export const accountSummarySchema = z.object({
   usable: z.boolean(),
   /** Whether automatic fallback may route turns onto this account. */
   fallbackEnabled: z.boolean(),
+  /** Custom load-balancing weight; null infers automatically from the Google AI plan (Ultra=20, Pro=1). */
+  weight: accountWeightSchema.nullable(),
+  /** Effective weight currently used for load balancing and weighted fallback. */
+  effectiveWeight: z.number().nonnegative(),
+  /** Live estimated share (0..1) of new Gemini-pool sessions when load balancing is enabled, else null. */
+  routingShare: z.number().min(0).max(1).nullable(),
   /** Active fallback cooldowns on this account (by quota pool or whole account). */
   cooldowns: z.array(accountCooldownSchema),
   /** Per-account Orchestrator override for profile accounts; null inherits the global choice. */
@@ -127,7 +147,7 @@ export type QuotaGroup = z.infer<typeof quotaGroupSchema>;
 export type QuotaBucket = z.infer<typeof quotaBucketSchema>;
 
 /** Strategy used when picking the next account for fallback (or smart routing). */
-export const fallbackStrategySchema = z.enum(["order", "quota", "reset"]);
+export const fallbackStrategySchema = z.enum(["order", "quota", "weighted", "reset"]);
 export type FallbackStrategy = z.infer<typeof fallbackStrategySchema>;
 
 /** Automatic account fallback when an Antigravity turn fails. */
@@ -135,11 +155,23 @@ export const fallbackSettingsSchema = z.object({
   enabled: z.boolean(),
   /** Retries on the same account for errors that may pass (network, 5xx, unknown) before moving on. */
   retries: z.number().int().min(0).max(3),
-  /** order: list order; quota: highest remaining quota for the model's pool; reset: soonest reset with quota left. */
+  /** order: list order; quota: highest remaining quota; weighted: plan weight * remaining quota; reset: soonest reset. */
   strategy: fallbackStrategySchema,
 });
 
 export type FallbackSettings = z.infer<typeof fallbackSettingsSchema>;
+
+/** How new Antigravity agents choose an account when none is explicitly selected. */
+export const routingModeSchema = z.enum(["default", "balanced", "capacity"]);
+export type RoutingMode = z.infer<typeof routingModeSchema>;
+
+export const routingSettingsSchema = z.object({
+  /** default: always defaultAccountId; balanced: dynamic weighted SWRR; capacity: highest effective weighted quota. */
+  mode: routingModeSchema,
+  /** Prefer accounts with remaining quota above this percentage (0..50) before dipping into low-quota accounts. */
+  reservePercent: z.number().int().min(0).max(50),
+});
+export type RoutingSettings = z.infer<typeof routingSettingsSchema>;
 
 export const accountsStateSchema = z.object({
   /** Accounts in configured fallback priority order. */
@@ -151,6 +183,7 @@ export const accountsStateSchema = z.object({
   /** Host-level problems to show above the list, for example "agy was not found". */
   problems: z.array(z.string()),
   fallback: fallbackSettingsSchema,
+  routing: routingSettingsSchema,
   /** Increases on every change; clients can compare it with the watch event. */
   revision: z.number().int().nonnegative(),
 });
@@ -206,13 +239,15 @@ export const moveAccountRpc = defineRpc({
   output: accountsStateSchema,
 });
 
-/** Updates per-account options: whether fallback may use it, and optional Orchestrator override. */
+/** Updates per-account options: fallback participation, load-balancing weight, and optional Orchestrator override. */
 export const setAccountOptionsRpc = defineRpc({
   name: "accounts.set-options",
   input: z
     .object({
       accountId: accountIdSchema,
       fallbackEnabled: z.boolean().optional(),
+      /** Custom load-balancing weight (0 disables auto-routing; null infers automatically from the plan). */
+      weight: accountWeightSchema.nullable().optional(),
       /** Pass null to inherit the global Orchestrator setting, or `{ planner, executor }` to override. */
       orchestratorOverride: orchestratorChoiceSchema.nullable().optional(),
     })
@@ -546,6 +581,12 @@ export const setPricingRpc = defineRpc({
 export const setFallbackRpc = defineRpc({
   name: "accounts.set-fallback",
   input: fallbackSettingsSchema.partial().strict(),
+  output: accountsStateSchema,
+});
+
+export const setRoutingRpc = defineRpc({
+  name: "accounts.set-routing",
+  input: routingSettingsSchema.partial().strict(),
   output: accountsStateSchema,
 });
 

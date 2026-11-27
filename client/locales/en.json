@@ -27,6 +27,10 @@
   },
   "badgeDefault": "Default",
   "badgeNoFallback": "Manual only",
+  "badgeWeightAuto": "Weight {{weight}}x · auto",
+  "badgeWeightCustom": "Weight {{weight}}x",
+  "badgeWeightWithShare": "Weight {{weight}}x · ~{{share}}",
+  "badgeWeightOff": "Excluded from balancing",
   "badgeCustomOrchestrator": "Custom orchestrator",
   "badgeCooldown": "Cooling down ({{pool}}, {{time}})",
   "cooldownPool": {
@@ -61,6 +65,7 @@
     "moveDown": "Move down in priority",
     "enableFallback": "Include in auto-switch",
     "disableFallback": "Exclude from auto-switch",
+    "setWeight": "Load-balancing weight…",
     "clearCooldown": "Clear cooldown",
     "orchestratorOverride": "Orchestrator models…",
     "recoverFiles": "Saved home files…",
@@ -124,7 +129,15 @@
     "overrideTitle": "Orchestrator for “{{label}}”",
     "overrideInherit": "Inherit global setting",
     "overrideCustom": "Override for this account",
-    "overrideSaved": "Saved Orchestrator setting for “{{label}}”"
+    "overrideSaved": "Saved Orchestrator setting for “{{label}}”",
+    "weightTitle": "Load-balancing weight for “{{label}}”",
+    "weightBody": "Inferred automatically from the Google AI plan by default (Ultra = 20x, Pro = 1x). Set 0 to exclude from new-session load balancing (manual or fallback only).",
+    "weightAuto": "Auto (plan: {{weight}}x)",
+    "weightPresets": "Quick presets",
+    "weightExclude": "0 (exclude)",
+    "weightInput": "Custom weight (0 – 100)",
+    "weightInvalid": "Enter a number between 0 and 100.",
+    "weightSaved": "Saved load-balancing weight for “{{label}}”"
   },
   "signin": {
     "title": "Sign in to “{{label}}”",
@@ -144,6 +157,8 @@
     "singleLine": "Paste a single line: the code or the page URL."
   },
   "account": "Account",
+  "composerAuto": "Auto balance",
+  "composerAutoDesc": "Route by plan weight (Ultra 20x / Pro 1x) & quota; stays sticky after creation",
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity account",
   "pillSignedOut": "Antigravity account (not signed in)",
@@ -299,6 +314,14 @@
     "label": "Antigravity: {{fiveHour}} of the 5-hour quota and {{weekly}} of the weekly quota left"
   },
   "settings": {
+    "routingMode": "New session load balancing",
+    "routingModeDefault": "Off (fixed default account)",
+    "routingModeBalanced": "Weighted load balancing (recommended)",
+    "routingModeCapacity": "Weighted capacity-first",
+    "routingReserve": "Reserve quota floor",
+    "routingReserveOff": "None (0%)",
+    "routingReservePct": "{{pct}}% (prefer accounts above floor)",
+    "routingStickyNote": "Balances new sessions by plan weight (Ultra 20x / Pro 1x), remaining quota, and concurrency. Existing sessions stay sticky to keep prompt cache warm and only switch on exhaustion or errors.",
     "fallback": "Switch account on errors",
     "retries": "Retries before switching",
     "retryNone": "None",
@@ -307,6 +330,7 @@
     "strategy": "Account selection strategy",
     "strategyOrder": "Priority order",
     "strategyQuota": "Most remaining quota",
+    "strategyWeighted": "Weighted remaining quota",
     "strategyReset": "Soonest quota reset"
   },
   "fallback": {

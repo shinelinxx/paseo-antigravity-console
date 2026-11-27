@@ -12,14 +12,16 @@ import {
   setAccountOptionsRpc,
   setDefaultAccountRpc,
   setFallbackRpc,
+  setRoutingRpc,
   signOutAccountRpc,
   type AccountSummary,
   type FallbackStrategy,
   type OrchestratorState,
+  type RoutingMode,
 } from "../shared/contracts";
 import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
-import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog } from "./dialogs";
+import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog, WeightDialog } from "./dialogs";
 import { displayLabel } from "./labels";
 import { antigravityLogoSvg } from "./logo";
 import { errorMessage, messages } from "./messages";
@@ -39,7 +41,8 @@ type Dialog =
   | { kind: "signIn"; account: AccountSummary }
   | { kind: "recoverFiles"; account: AccountSummary }
   | { kind: "manageAgents"; account: AccountSummary }
-  | { kind: "orchestratorOverride"; account: AccountSummary };
+  | { kind: "orchestratorOverride"; account: AccountSummary }
+  | { kind: "setWeight"; account: AccountSummary };
 
 function SectionTitle({ colors, title, count }: { colors: Colors; title: string; count?: number }) {
   return (
@@ -89,6 +92,7 @@ function AccountsGrid({
   accounts,
   colors,
   counts,
+  routingMode,
   busy,
   compact,
   cardWidth,
@@ -102,6 +106,7 @@ function AccountsGrid({
   accounts: readonly AccountSummary[];
   colors: Colors;
   counts: ReadonlyMap<string, number> | null;
+  routingMode: RoutingMode;
   busy: Readonly<Record<string, CardAction | null>>;
   compact: boolean;
   cardWidth: number;
@@ -135,6 +140,7 @@ function AccountsGrid({
               account={account}
               colors={colors}
               count={counts ? (counts.get(account.id) ?? 0) : undefined}
+              routingMode={routingMode}
               now={now}
               busy={busy[account.id] ?? null}
               compact={compact}
@@ -172,6 +178,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const remove = useRpc(removeAccountRpc);
   const setDefault = useRpc(setDefaultAccountRpc);
   const setFallback = useRpc(setFallbackRpc);
+  const setRouting = useRpc(setRoutingRpc);
   const signOut = useRpc(signOutAccountRpc);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
@@ -270,6 +277,8 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
         return openDialog({ kind: "manageAgents", account }, wasModalMenuOpen);
       case "orchestratorOverride":
         return openDialog({ kind: "orchestratorOverride", account }, wasModalMenuOpen);
+      case "setWeight":
+        return openDialog({ kind: "setWeight", account }, wasModalMenuOpen);
     }
   }
 
@@ -382,6 +391,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                 accounts={data.accounts}
                 colors={colors}
                 counts={counts}
+                routingMode={data.routing.mode}
                 busy={busy}
                 compact={compact}
                 cardWidth={cardWidth}
@@ -399,6 +409,34 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
             <View style={{ gap: space.md }}>
               <SectionTitle colors={colors} title={t("settingsHeading")} />
               <SettingsCard>
+                <SettingsSelect
+                  label={t("settings.routingMode")}
+                  value={data.routing.mode}
+                  options={[
+                    { value: "default", label: t("settings.routingModeDefault") },
+                    { value: "balanced", label: t("settings.routingModeBalanced") },
+                    { value: "capacity", label: t("settings.routingModeCapacity") },
+                  ]}
+                  onValueChange={(value) => {
+                    void setRouting({ mode: value as RoutingMode })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
+                <SettingsSelect
+                  label={t("settings.routingReserve")}
+                  disabled={data.routing.mode === "default"}
+                  value={String(data.routing.reservePercent)}
+                  options={[0, 5, 10, 15, 20].map((pct) => ({
+                    value: String(pct),
+                    label: pct === 0 ? t("settings.routingReserveOff") : t("settings.routingReservePct", { pct }),
+                  }))}
+                  onValueChange={(value) => {
+                    void setRouting({ reservePercent: Number(value) })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
                 <SettingsSelect
                   label={t("overview.default")}
                   value={data.defaultAccountId}
@@ -441,6 +479,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   options={[
                     { value: "order", label: t("settings.strategyOrder") },
                     { value: "quota", label: t("settings.strategyQuota") },
+                    { value: "weighted", label: t("settings.strategyWeighted") },
                     { value: "reset", label: t("settings.strategyReset") },
                   ]}
                   onValueChange={(value) => {
@@ -456,6 +495,14 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   </Text>
                 </SettingsRow>
               </SettingsCard>
+              {data.routing.mode !== "default" ? (
+                <Callout
+                  colors={colors}
+                  tone="neutral"
+                  icon="Gauge"
+                  title={t("settings.routingStickyNote")}
+                />
+              ) : null}
               {defaultUnavailable && fallback ? (
                 <Callout
                   colors={colors}
@@ -547,6 +594,21 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           onSaved={(state) => {
             observation.setOrchestrator(state);
             void refetch();
+          }}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {dialog?.kind === "setWeight" ? (
+        <WeightDialog
+          colors={colors}
+          account={dialog.account}
+          onSave={async (weight) => {
+            const state = await setOptions({ accountId: dialog.account.id, weight });
+            accept(state);
+            toast.show(
+              t("dialog.weightSaved", { label: displayLabel(dialog.account.label, t, dialog.account.kind) }),
+              { variant: "success" },
+            );
           }}
           onClose={() => setDialog(null)}
         />

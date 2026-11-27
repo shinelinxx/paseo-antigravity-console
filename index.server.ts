@@ -20,6 +20,7 @@ import {
   setFallbackRpc,
   setOrchestratorRpc,
   setPricingRpc,
+  setRoutingRpc,
   signOutAccountRpc,
   startSignInRpc,
   subagentArtifactRpc,
@@ -34,9 +35,10 @@ import {
 import { AccountService } from "./server/accounts";
 import { ContextReader } from "./server/context";
 import { FallbackController } from "./server/fallback";
-import { PendingSwitches, migrateAccountAgents, registerHooks, switchAgentAccount } from "./server/hooks";
+import { ActiveLoadTracker, PendingSwitches, migrateAccountAgents, registerHooks, switchAgentAccount } from "./server/hooks";
 import { OrchestratorSettings } from "./server/orchestrator";
 import { PricingStore } from "./server/pricing";
+import { AccountRouter } from "./server/router";
 import { UsageStatsReader } from "./server/stats";
 import { SubagentReader } from "./server/subagents";
 import { createUsageSource } from "./server/usage";
@@ -101,18 +103,29 @@ export default function contribute(server: PluginServerContext) {
   }, 15 * 60_000);
   sweepTimer.unref?.();
 
+  const activeLoad = new ActiveLoadTracker();
+  service.setRunningCountProvider(() => activeLoad.snapshot());
   const fallback = new FallbackController(service, pending, orchestrator);
-  const removers = registerHooks(server, service, pending, fallback, {
-    onConversationTurnStart: (agentId, conversationId, accountId, startedAt) =>
-      stats.beginConversationTurn(agentId, conversationId, accountId, startedAt),
-    onConversationTurnEnd: (agentId) => stats.endConversationTurn(agentId),
-    onConversationTurn: (conversationId, accountId, startedAt, endedAt) =>
-      stats.recordConversationTurn(conversationId, accountId, startedAt, endedAt),
-    onAgentArchived: (agentId) => {
-      context.forget(agentId);
-      subagents.forget(agentId);
+  const router = new AccountRouter(service, fallback, orchestrator, (accountId) => activeLoad.countFor(accountId));
+  const removers = registerHooks(
+    server,
+    service,
+    pending,
+    fallback,
+    {
+      onConversationTurnStart: (agentId, conversationId, accountId, startedAt) =>
+        stats.beginConversationTurn(agentId, conversationId, accountId, startedAt),
+      onConversationTurnEnd: (agentId) => stats.endConversationTurn(agentId),
+      onConversationTurn: (conversationId, accountId, startedAt, endedAt) =>
+        stats.recordConversationTurn(conversationId, accountId, startedAt, endedAt),
+      onAgentArchived: (agentId) => {
+        context.forget(agentId);
+        subagents.forget(agentId);
+      },
     },
-  });
+    router,
+    activeLoad,
+  );
   removers.push(fallback.register(server));
   removers.push(...orchestrator.register(server));
   server.registerUsageSource(createUsageSource(service));
@@ -153,9 +166,10 @@ export default function contribute(server: PluginServerContext) {
     return service.state();
   });
 
-  server.handle(setAccountOptionsRpc, async ({ accountId, fallbackEnabled, orchestratorOverride }) => {
+  server.handle(setAccountOptionsRpc, async ({ accountId, fallbackEnabled, weight, orchestratorOverride }) => {
     await ready;
-    await service.setAccountOptions(accountId, { fallbackEnabled, orchestratorOverride });
+    await service.setAccountOptions(accountId, { fallbackEnabled, weight, orchestratorOverride });
+    if (weight !== undefined) router.reset();
     return service.state();
   });
 
@@ -170,6 +184,13 @@ export default function contribute(server: PluginServerContext) {
     await ready;
     await service.setFallback(patch);
     if (patch.enabled === false) fallback.cancelAllRetries();
+    return service.state();
+  });
+
+  server.handle(setRoutingRpc, async (patch) => {
+    await ready;
+    await service.setRouting(patch);
+    router.reset();
     return service.state();
   });
 

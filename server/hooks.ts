@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   ACCOUNT_METADATA_KEY,
+  AUTO_ACCOUNT_ID,
   SYSTEM_ACCOUNT_ID,
   accountIdFromMetadata,
   isAntigravityProvider,
@@ -250,6 +251,50 @@ export async function migrateAccountAgents(
   return { switched, scheduled, skipped, failed, targetLabel };
 }
 
+/** Tracks currently running Antigravity turns per account for concurrency-aware load balancing. */
+export class ActiveLoadTracker {
+  private readonly agentAccounts = new Map<string, string>();
+  private readonly counts = new Map<string, number>();
+
+  begin(agentId: string, accountId: string): void {
+    const previous = this.agentAccounts.get(agentId);
+    if (previous === accountId) return;
+    if (previous) this.decrement(previous);
+    this.agentAccounts.set(agentId, accountId);
+    this.counts.set(accountId, (this.counts.get(accountId) ?? 0) + 1);
+  }
+
+  end(agentId: string): void {
+    const previous = this.agentAccounts.get(agentId);
+    if (!previous) return;
+    this.agentAccounts.delete(agentId);
+    this.decrement(previous);
+  }
+
+  countFor(accountId: string): number {
+    return this.counts.get(accountId) ?? 0;
+  }
+
+  snapshot(): ReadonlyMap<string, number> {
+    return new Map(this.counts);
+  }
+
+  clear(): void {
+    this.agentAccounts.clear();
+    this.counts.clear();
+  }
+
+  private decrement(accountId: string): void {
+    const next = (this.counts.get(accountId) ?? 0) - 1;
+    if (next > 0) this.counts.set(accountId, next);
+    else this.counts.delete(accountId);
+  }
+}
+
+export interface NewAgentRouter {
+  pickForNewAgent(model?: string | null): Promise<string | null>;
+}
+
 /** The fallback controller's part of the session-open path; kept as an interface to avoid an import cycle. */
 export interface OpenFallback {
   healthOf(accountId: string, model?: string | null): Promise<FallbackEvent["reason"] | null>;
@@ -277,6 +322,8 @@ export function registerHooks(
   pending: PendingSwitches,
   fallback?: OpenFallback,
   observers?: HookObservers,
+  router?: NewAgentRouter,
+  activeLoad?: ActiveLoadTracker,
 ): Array<() => void> {
   const removers: Array<() => void> = [];
   const activeTurns = new Map<string, { turnId: string | null; accountId: string; startedAt: number }>();
@@ -291,25 +338,47 @@ export function registerHooks(
     return conversationId;
   }
 
-  // New Antigravity agents get the default account (or best fallback when configured & default is unavailable).
+  // New Antigravity agents get a load-balanced account (when enabled) or the default account (+ fallback if unhealthy).
+  // Once assigned into metadata, the session stays strictly sticky to that account unless fallback triggers on error.
   removers.push(
     server.addHook("agent.create.before", async ({ request }) => {
       if (!isAntigravityProvider(request.config.provider)) return undefined;
       await service.init();
       const metadata = request.metadata ?? {};
-      if (typeof metadata[ACCOUNT_METADATA_KEY] === "string") return undefined;
+      const explicit = metadata[ACCOUNT_METADATA_KEY];
+      if (typeof explicit === "string" && explicit.length > 0 && explicit !== AUTO_ACCOUNT_ID) {
+        return undefined;
+      }
       const state = await service.state();
       const model = request.config.model ?? null;
-      let chosen = state.defaultAccountId;
-      const fallbackSettings = service.fallbackSettings();
-      if (fallbackSettings.enabled && fallback) {
-        const problem = await fallback.healthOf(chosen, model);
-        if (problem) {
-          const better = await fallback.pickNext(chosen, new Set([chosen]), model);
-          if (better) chosen = better;
+      const routingSettings = service.routingSettings();
+      let chosen: string | null = null;
+      if (routingSettings.mode !== "default" && router) {
+        chosen = await router.pickForNewAgent(model).catch((error: unknown) => {
+          console.error("antigravity-accounts: load-balanced routing failed", error);
+          return null;
+        });
+      }
+      if (!chosen) {
+        chosen = state.defaultAccountId;
+        const fallbackSettings = service.fallbackSettings();
+        if (fallbackSettings.enabled && fallback) {
+          const problem = await fallback.healthOf(chosen, model);
+          if (problem) {
+            const better = await fallback.pickNext(chosen, new Set([chosen]), model);
+            if (better) chosen = better;
+          }
         }
       }
-      if (chosen === SYSTEM_ACCOUNT_ID) return undefined;
+      if (chosen === SYSTEM_ACCOUNT_ID) {
+        if (explicit === AUTO_ACCOUNT_ID || routingSettings.mode !== "default") {
+          return {
+            ...request,
+            metadata: { ...metadata, [ACCOUNT_METADATA_KEY]: SYSTEM_ACCOUNT_ID },
+          };
+        }
+        return undefined;
+      }
       const account = service.store.get(chosen);
       if (
         !account ||
@@ -319,8 +388,14 @@ export function registerHooks(
       ) {
         // A default that cannot run would make every new agent fail; leave it on the system sign-in.
         console.warn(
-          `antigravity-accounts: default account ${chosen} cannot run; new agent stays on the system sign-in`,
+          `antigravity-accounts: selected account ${chosen} cannot run; new agent stays on the system sign-in`,
         );
+        if (explicit === AUTO_ACCOUNT_ID) {
+          return {
+            ...request,
+            metadata: { ...metadata, [ACCOUNT_METADATA_KEY]: SYSTEM_ACCOUNT_ID },
+          };
+        }
         return undefined;
       }
       return {
@@ -397,6 +472,7 @@ export function registerHooks(
       const startedAt = Date.now();
       const entry = { turnId, accountId, startedAt };
       activeTurns.set(agent.id, entry);
+      activeLoad?.begin(agent.id, accountId);
       if (observers?.onConversationTurnStart) {
         const conversationId = await resolveConversationId(paseo, agent.id);
         if (conversationId && activeTurns.get(agent.id) === entry) {
@@ -417,6 +493,7 @@ export function registerHooks(
         active && (active.turnId === turnId || active.turnId === null || turnId === null) ? active : undefined;
       if (turn) {
         activeTurns.delete(agent.id);
+        activeLoad?.end(agent.id);
         observers?.onConversationTurnEnd?.(agent.id);
       }
       const accountId = turn?.accountId ?? pending.sessionAccountOf(agent.id) ?? accountIdFromMetadata(agent.metadata);
@@ -441,6 +518,7 @@ export function registerHooks(
     for (const timer of quotaRefresh.values()) clearTimeout(timer);
     quotaRefresh.clear();
     agentConversations.clear();
+    activeLoad?.clear();
   });
 
   // Deferred switches run as soon as the agent's turn ends.
@@ -467,6 +545,7 @@ export function registerHooks(
     server.addHook("agent.close.after", async ({ agent }, { paseo }) => {
       if (!isAntigravityProvider(agent.provider)) return;
       pending.clearSessionAccount(agent.id);
+      activeLoad?.end(agent.id);
       const active = activeTurns.get(agent.id);
       if (active) {
         const endedAt = Date.now();
@@ -488,6 +567,7 @@ export function registerHooks(
       pending.delete(agent.id);
       pending.clearSessionAccount(agent.id);
       activeTurns.delete(agent.id);
+      activeLoad?.end(agent.id);
       agentConversations.delete(agent.id);
       observers?.onConversationTurnEnd?.(agent.id);
       observers?.onAgentArchived?.(agent.id);

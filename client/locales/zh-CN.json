@@ -27,6 +27,10 @@
   },
   "badgeDefault": "默认",
   "badgeNoFallback": "仅手动",
+  "badgeWeightAuto": "权重 {{weight}}x · 自动",
+  "badgeWeightCustom": "权重 {{weight}}x",
+  "badgeWeightWithShare": "权重 {{weight}}x · 约 {{share}}",
+  "badgeWeightOff": "不参与分流",
   "badgeCustomOrchestrator": "自定义 Orchestrator",
   "badgeCooldown": "冷却中（{{pool}}，{{time}}）",
   "cooldownPool": {
@@ -60,6 +64,7 @@
     "moveDown": "降低切换优先级",
     "enableFallback": "参与自动切换",
     "disableFallback": "不参与自动切换",
+    "setWeight": "调整负载均衡权重…",
     "clearCooldown": "解除冷却",
     "orchestratorOverride": "单独设置 Orchestrator…",
     "recoverFiles": "查看/回收主目录文件…",
@@ -119,7 +124,15 @@
     "overrideTitle": "「{{label}}」的 Orchestrator 设置",
     "overrideInherit": "继承全局设置",
     "overrideCustom": "为此账号单独指定",
-    "overrideSaved": "已保存「{{label}}」的 Orchestrator 设置"
+    "overrideSaved": "已保存「{{label}}」的 Orchestrator 设置",
+    "weightTitle": "「{{label}}」的负载均衡权重",
+    "weightBody": "默认按套餐自动推断（Ultra = 20x，Pro = 1x）。设为 0 表示不主动分配新会话（仅手动或出错兜底使用）。",
+    "weightAuto": "自动（按套餐 {{weight}}x）",
+    "weightPresets": "快捷预设",
+    "weightExclude": "0（不参与分流）",
+    "weightInput": "自定义倍率（0 – 100）",
+    "weightInvalid": "请输入 0 到 100 之间的数字。",
+    "weightSaved": "已保存「{{label}}」的权重设置"
   },
   "signin": {
     "title": "登录「{{label}}」",
@@ -139,6 +152,8 @@
     "singleLine": "请粘贴单行内容：授权码或跳转页面的完整网址。"
   },
   "account": "账号",
+  "composerAuto": "自动均衡",
+  "composerAutoDesc": "按套餐权重（Ultra 20x / Pro 1x）与剩余额度分配，创建后锁定会话",
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity 账号",
   "pillSignedOut": "Antigravity 账号（未登录）",
@@ -290,6 +305,14 @@
     "label": "Antigravity：5 小时额度剩余 {{fiveHour}}，每周额度剩余 {{weekly}}"
   },
   "settings": {
+    "routingMode": "新会话负载均衡",
+    "routingModeDefault": "关闭（固定使用默认账号）",
+    "routingModeBalanced": "加权负载均衡（推荐）",
+    "routingModeCapacity": "加权高余量优先",
+    "routingReserve": "安全预留水位",
+    "routingReserveOff": "不预留（0%）",
+    "routingReservePct": "{{pct}}%（优先分配高于此水位的账号）",
+    "routingStickyNote": "负载均衡仅在新建会话时按套餐权重（Ultra 20x / Pro 1x）、剩余额度与实时并发分配，创建后会话严格绑定原账号以保持缓存命中，仅在额度耗尽或报错时自动切换。",
     "fallback": "出错时自动切换账号",
     "retries": "切换前重试",
     "retryNone": "不重试",
@@ -297,6 +320,7 @@
     "strategy": "自动切换选号策略",
     "strategyOrder": "按列表优先级顺序",
     "strategyQuota": "剩余额度最多优先",
+    "strategyWeighted": "按套餐权重与剩余额度优先",
     "strategyReset": "最快重置优先"
   },
   "fallback": {

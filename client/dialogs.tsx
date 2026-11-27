@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   RECOVERY_FOLDER_NAME,
+  inferPlanWeight,
   migrateAccountAgentsRpc,
   recoverSavedFilesRpc,
   savedFilesRpc,
@@ -476,6 +477,137 @@ export function AccountAgentsDialog({
               onPress={() => void onMigrate()}
             />
           ) : null}
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
+function formatWeightNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+}
+
+/** Edits an account's load-balancing weight override (null = auto from plan, 0 = excluded). */
+export function WeightDialog({
+  colors,
+  account,
+  onSave,
+  onClose,
+}: {
+  colors: Colors;
+  account: AccountSummary;
+  onSave(weight: number | null): Promise<void>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation(messages);
+  const label = displayLabel(account.label, t, account.kind);
+  const inferred = inferPlanWeight(account.plan);
+  const [useAuto, setUseAuto] = useState(account.weight === null);
+  const [input, setInput] = useState(
+    account.weight === null ? formatWeightNumber(inferred) : formatWeightNumber(account.weight),
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const parsed = Number(input.trim());
+  const customValid = input.trim().length > 0 && Number.isFinite(parsed) && parsed >= 0 && parsed <= 100;
+  const presets = [0, 1, 5, 10, 20];
+
+  async function save() {
+    if (busy) return;
+    if (!useAuto && !customValid) {
+      setError(t("dialog.weightInvalid"));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await onSave(useAuto ? null : Number(parsed.toFixed(2)));
+      onClose();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open title={t("dialog.weightTitle", { label })} onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
+      <Modal.Content>
+        <Muted colors={colors}>{t("dialog.weightBody")}</Muted>
+        <View style={{ gap: space.xs + 2 }}>
+          <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>{t("dialog.weightPresets")}</Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs + 2 }}>
+            <Button
+              colors={colors}
+              size="sm"
+              variant={useAuto ? "primary" : "secondary"}
+              label={t("dialog.weightAuto", { weight: formatWeightNumber(inferred) })}
+              disabled={busy}
+              onPress={() => {
+                setUseAuto(true);
+                setInput(formatWeightNumber(inferred));
+                setError("");
+              }}
+            />
+            {presets.map((preset) => {
+              const active = !useAuto && customValid && Math.abs(parsed - preset) < 1e-6;
+              return (
+                <Button
+                  key={preset}
+                  colors={colors}
+                  size="sm"
+                  variant={active ? "primary" : "secondary"}
+                  label={preset === 0 ? t("dialog.weightExclude") : `${preset}x`}
+                  disabled={busy}
+                  onPress={() => {
+                    setUseAuto(false);
+                    setInput(String(preset));
+                    setError("");
+                  }}
+                />
+              );
+            })}
+          </View>
+        </View>
+        <View style={{ gap: space.xs + 2 }}>
+          <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>{t("dialog.weightInput")}</Text>
+          <TextInput
+            accessibilityLabel={t("dialog.weightInput")}
+            keyboardType="decimal-pad"
+            value={input}
+            editable={!busy}
+            onChangeText={(text) => {
+              setUseAuto(false);
+              setInput(text);
+              setError("");
+            }}
+            onSubmitEditing={() => void save()}
+            placeholder={formatWeightNumber(inferred)}
+            placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+            style={{
+              ...font.body,
+              color: colors.foreground,
+              backgroundColor: colors.surface0,
+              borderColor: colors.border,
+              borderWidth: 1,
+              borderRadius: radius.md,
+              paddingHorizontal: space.md,
+              paddingVertical: space.sm + 2,
+              opacity: useAuto ? 0.6 : 1,
+            }}
+          />
+        </View>
+        {error ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={error} /> : null}
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
+          <Button colors={colors} variant="ghost" label={t("dialog.cancel")} disabled={busy} onPress={onClose} />
+          <Button
+            colors={colors}
+            variant="primary"
+            label={t("dialog.save")}
+            loading={busy}
+            disabled={!useAuto && !customValid}
+            onPress={() => void save()}
+          />
         </View>
       </Modal.Content>
     </Modal>
