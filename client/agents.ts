@@ -10,12 +10,13 @@ import { useEffect } from "react";
 import {
   SYSTEM_ACCOUNT_ID,
   accountIdFromMetadata,
+  agentTasksRpc,
   contextUsageRpc,
   getOrchestratorRpc,
   isAntigravityProvider,
   isOrchestratorModel,
+  isUnsupportedBackgroundFilterError,
   listAccountsRpc,
-  quotaPoolForModel,
   setOrchestratorRpc,
   subagentCountsRpc,
   switchAgentAccountRpc,
@@ -25,18 +26,20 @@ import {
   type ContextUsage,
   type ModelFamily,
   type OrchestratorState,
-  type QuotaGroup,
 } from "../shared/contracts";
 import { ContextPopover, contextStore } from "./context";
-import { percent, tokens } from "./format";
+import { percent, tokens, usd } from "./format";
 import { displayLabel, shortPlan } from "./labels";
 import { errorMessage, messages } from "./messages";
 import { resolvePresets, shortModelLabel } from "./orchestrator";
+import { accountSupportsModel, activeCooldownForModel, compactQuotaSummary } from "./quota";
+import { TasksPopover, countSteps, tasksStore } from "./tools";
 
 type AgentRow = {
   id: string;
   workspaceId?: string | null;
   archivedAt?: unknown;
+  persistence?: unknown;
   metadata?: Readonly<Record<string, unknown>> | null;
   provider: string;
   model?: string | null;
@@ -46,11 +49,45 @@ type AgentRow = {
 
 export interface ObservedAgent {
   id: string;
+  sessionKey: string | null;
   workspace: string | null;
   account: string;
   running: boolean;
   model: string | null;
   title: string | null;
+}
+
+// Keep UUID precedence aligned with conversationIdFrom in server/context.ts.
+function persistenceSessionKey(persistence: unknown): string | null {
+  const record = persistence as Record<string, unknown> | null;
+  if (!record || typeof record !== "object") return typeof persistence === "string" ? persistence.trim() || null : null;
+  const meta = record.metadata as Record<string, unknown> | undefined;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const candidates: unknown[] = [];
+  function addProvider(handle: unknown) {
+    const data = (handle as { data?: Record<string, unknown> } | null)?.data;
+    candidates.push(data?.sessionId, data?.conversationId);
+  }
+  addProvider(meta?.pluginProviderPersistence);
+  for (const handle of [record.sessionId, record.nativeHandle]) {
+    if (typeof handle === "string" && handle.startsWith("plugin:")) {
+      try {
+        addProvider(JSON.parse(handle.slice(7)));
+      } catch {
+        /* Try the legacy fields. */
+      }
+    }
+  }
+  candidates.push(
+    record.conversationId,
+    record.nativeHandle,
+    record.sessionId,
+    meta?.conversationId,
+    meta?.nativeHandle,
+    meta?.sessionId,
+  );
+  const strings = candidates.filter((value): value is string => typeof value === "string");
+  return strings.find((value) => uuid.test(value)) ?? strings.map((value) => value.trim()).find(Boolean) ?? null;
 }
 
 type OpenSubagents = (agentId: string, workspaceId: string | null | undefined, subagentId?: string) => void;
@@ -64,54 +101,12 @@ type Counts = ReadonlyMap<string, number>;
 type WorkspaceSubagents = ReadonlyMap<string, number>;
 type Timer = ReturnType<typeof setTimeout>;
 
+// Preserved low-frequency background polling constants (4a36703).
 const CONTEXT_POLL_MS = 10_000;
 const IDLE_POLL_MS = 5 * 60_000;
 const STARTUP_POLL_DELAY_MS = 2500;
 const LIVE_POLL_DELAY_MS = 800;
 const POLL_BATCH_SIZE = 100;
-
-export interface PoolQuotaSummary {
-  fiveHour: number | null;
-  weekly: number | null;
-  /** Minimum active remaining fraction across all buckets in the model's pool. */
-  minRemaining: number | null;
-}
-
-/** Remaining quota summary for the model's pool (5h, weekly, and overall minimum). */
-export function poolQuotaInfo(
-  quota: readonly QuotaGroup[] | null | undefined,
-  model: string | null | undefined,
-  now = Date.now(),
-): PoolQuotaSummary {
-  if (!quota?.length) return { fiveHour: null, weekly: null, minRemaining: null };
-  const pool = quotaPoolForModel(model);
-  const group =
-    pool === "third-party"
-      ? (quota.find((g) => /claude|gpt|3p|third/i.test(g.name)) ?? quota.find((g) => !/gemini/i.test(g.name)) ?? null)
-      : (quota.find((g) => /gemini/i.test(g.name) && !/argon/i.test(g.name)) ?? quota[0] ?? null);
-  if (!group) return { fiveHour: null, weekly: null, minRemaining: null };
-  const enabled = group.buckets.filter((b) => !b.disabled && b.remainingFraction !== null);
-  const pickWindow = (name: string) =>
-    enabled.find((b) => b.window.trim().toLowerCase() === name)?.remainingFraction ?? null;
-  const values = enabled.map((b) => {
-    const resetAt = b.resetTime ? Date.parse(b.resetTime) : NaN;
-    return Number.isFinite(resetAt) && resetAt <= now ? 1 : b.remainingFraction!;
-  });
-  return {
-    fiveHour: pickWindow("5h"),
-    weekly: pickWindow("weekly"),
-    minRemaining: values.length ? Math.min(...values) : null,
-  };
-}
-
-/** Compact 5h & weekly quota label (e.g. "5h 91% · 7d 91%") for pills and pickers. */
-export function formatPoolQuota(info: PoolQuotaSummary, locale: string): string | null {
-  const parts: string[] = [];
-  if (info.fiveHour !== null) parts.push(`5h ${percent(info.fiveHour, locale)}`);
-  if (info.weekly !== null) parts.push(`7d ${percent(info.weekly, locale)}`);
-  if (parts.length > 0) return parts.join(" · ");
-  return info.minRemaining !== null ? percent(info.minRemaining, locale) : null;
-}
 
 function chunk<T>(items: readonly T[], size: number): T[][] {
   const result: T[][] = [];
@@ -121,20 +116,39 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
   return result;
 }
 
+function sameSession(
+  a: ContextUsage["session"] | null | undefined,
+  b: ContextUsage["session"] | null | undefined,
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    a.requests === b.requests &&
+    a.input === b.input &&
+    a.cached === b.cached &&
+    a.output === b.output &&
+    a.cost === b.cost &&
+    a.pricedRequests === b.pricedRequests
+  );
+}
+
 export function observeAgents(client: PluginClientContext, openSubagents: OpenSubagents) {
   const lifetime = new AbortController();
   const agents = new Map<string, ObservedAgent>();
   const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const contextPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const tasksPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const accountPillSigs = new Map<string, string>();
   const contextPillSigs = new Map<string, string>();
   const subagentPillSigs = new Map<string, string>();
+  const tasksPillSigs = new Map<string, string>();
   const orchestratorPillSigs = new Map<string, string>();
   const subagentCounts = new Map<string, { total: number; running: number }>();
   const scheduledSwitches = new Map<string, string>();
   const lastPolledAt = new Map<string, number>();
+  const sessionGen = new Map<string, number>();
   let orchestrator: OrchestratorState | undefined;
   const nativeContext = new Set<string>();
   const listeners = new Set<() => void>();
@@ -196,7 +210,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
     const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
     if (result.result === "scheduled") scheduledSwitches.set(agentId, account.id);
-    else scheduledSwitches.delete(agentId);
+    else if (result.result !== "busy") scheduledSwitches.delete(agentId);
     const tracked = agents.get(agentId);
     if (tracked) renderAccountPill(tracked);
     notify(client.i18n.t(messages, result.result, { label: nameOf(result.accountLabel, account.kind) }));
@@ -206,25 +220,28 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
 
   function renderAccountPill(agent: ObservedAgent) {
     if (!agent.workspace) return;
-    const current = accounts?.accounts.find((account) => account.id === agent.account);
+    const list = accounts?.accounts ?? [];
+    const current = list.find((account) => account.id === agent.account);
     const healthy = !current || (current.usable && current.status !== "signed-out");
     const scheduledTarget = agent.running ? scheduledSwitches.get(agent.id) : undefined;
     const now = Date.now();
-    const pool = quotaPoolForModel(agent.model);
-    const choices: PluginButtonMenuEntry<PluginText>[] = (accounts?.accounts ?? []).map((account) => {
+    const labelCounts = new Map<string, number>();
+    for (const account of list) {
+      const display = nameOf(account.label, account.kind).toLowerCase();
+      labelCounts.set(display, (labelCounts.get(display) ?? 0) + 1);
+    }
+    const choices: PluginButtonMenuEntry<PluginText>[] = list.map((account) => {
       const selected = account.id === agent.account;
       const queuedHere = scheduledTarget === account.id;
       const unavailable = !account.usable || account.status === "signed-out";
-      const label = nameOf(account.label, account.kind);
-      const planTag = shortPlan(account.plan, label);
-      const quotaInfo = !unavailable ? poolQuotaInfo(account.quota, agent.model, now) : null;
-      const quotaText = quotaInfo ? formatPoolQuota(quotaInfo, client.i18n.locale) : null;
-      const cooling = account.cooldowns.some(
-        (c) => (c.pool === "all" || c.pool === pool) && Date.parse(c.until) > now,
-      );
-      const stateTag = unavailable
-        ? client.i18n.t(messages, `status.${account.status}`)
-        : quotaText;
+      const display = nameOf(account.label, account.kind);
+      const duplicateName = (labelCounts.get(display.toLowerCase()) ?? 0) > 1;
+      const disambiguator = duplicateName ? (account.email ?? account.id) : null;
+      const planTag = shortPlan(account.plan, display);
+      const quota = !unavailable ? compactQuotaSummary(account, agent.model, client.i18n.locale) : null;
+      const cooling = activeCooldownForModel(account, agent.model, now);
+      const supported = accountSupportsModel(account, agent.model);
+      const stateTag = unavailable ? client.i18n.t(messages, `status.${account.status}`) : quota;
       const action = (when: "now" | "after-turn") => ({
         kind: "action" as const,
         onPress: () => switchTo(agent.id, account, when),
@@ -232,7 +249,15 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       return {
         kind: "item",
         id: account.id,
-        title: [label, planTag, stateTag, cooling ? client.i18n.t(messages, "pillCooling") : null]
+        title: [
+          display,
+          disambiguator,
+          account.note,
+          planTag,
+          stateTag,
+          supported === false ? client.i18n.t(messages, "modelUnsupported") : null,
+          cooling ? client.i18n.t(messages, "coolingShort") : null,
+        ]
           .filter(Boolean)
           .join(" · "),
         icon: selected
@@ -241,8 +266,8 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
             ? "Clock"
             : unavailable
               ? "UserX"
-              : quotaInfo && quotaInfo.minRemaining !== null && quotaInfo.minRemaining <= 0.001
-                ? "AlertTriangle"
+              : supported === false || cooling
+                ? "TriangleAlert"
                 : "UserRound",
         disabled: (selected && !scheduledTarget) || unavailable,
         behavior:
@@ -266,8 +291,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) },
     });
     const currentLabel = current ? nameOf(current.label, current.kind) : agent.account;
-    const currentQuota =
-      current && healthy ? formatPoolQuota(poolQuotaInfo(current.quota, agent.model, now), client.i18n.locale) : null;
+    const currentQuota = current && healthy ? compactQuotaSummary(current, agent.model, client.i18n.locale) : null;
     const label = currentQuota ? `${currentLabel} · ${currentQuota}` : currentLabel;
     const choiceSig = choices
       .map((entry) =>
@@ -295,9 +319,18 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
   }
 
-  // ---- Context pill -------------------------------------------------------------------------
+  // ---- Context & Session totals pill --------------------------------------------------------
 
-  function contextLabel(usage: ContextUsage | null | undefined): PluginText {
+  function contextLabel(usage: ContextUsage | null | undefined, isNative: boolean): PluginText | null {
+    if (isNative) {
+      const session = usage?.session;
+      if (!session || session.requests <= 0) return null;
+      const totalTokens = session.input + session.cached + session.output;
+      if (session.pricedRequests > 0) {
+        return `${usd(session.cost, client.i18n.locale)} · ${tokens(totalTokens)}`;
+      }
+      return tokens(totalTokens);
+    }
     if (!usage) return messages.message("context.labelEmpty");
     if (!usage.size) return messages.message("context.labelNoSize", { used: tokens(usage.used) });
     return messages.message("context.label", {
@@ -308,28 +341,33 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   }
 
   function renderContextPill(agent: ObservedAgent) {
-    if (!agent.workspace || nativeContext.has(agent.id)) {
+    const isNative = nativeContext.has(agent.id);
+    const usage = contextStore.get(agent.id);
+    const label = agent.workspace ? contextLabel(usage, isNative) : null;
+    if (!agent.workspace || label === null) {
       contextPills.get(agent.id)?.remove();
       contextPills.delete(agent.id);
       contextPillSigs.delete(agent.id);
       return;
     }
-    const usage = contextStore.get(agent.id);
+    const session = usage?.session;
+    const sessionSig = session
+      ? `${session.requests}:${session.input}:${session.cached}:${session.output}:${session.cost}:${session.pricedRequests}`
+      : "";
     const sig = usage
-      ? `${agent.workspace}|${usage.used}|${usage.size ?? ""}|${client.i18n.locale}`
-      : `${agent.workspace}|empty|${client.i18n.locale}`;
+      ? `${agent.workspace}|${isNative ? 1 : 0}|${usage.used}|${usage.size ?? ""}|${sessionSig}|${client.i18n.locale}`
+      : `${agent.workspace}|${isNative ? 1 : 0}|empty|${client.i18n.locale}`;
     const pill = contextPills.get(agent.id);
     if (pill && contextPillSigs.get(agent.id) === sig) return;
     contextPillSigs.set(agent.id, sig);
-    const label = contextLabel(usage);
-    if (pill) pill.update({ label });
+    const button: PluginButton<PluginText> = {
+      icon: isNative ? "Activity" : "Gauge",
+      title: isNative ? messages.message("context.sessionTitle") : messages.message("context.title"),
+      label,
+      behavior: { kind: "popover", Content: ContextPopover },
+    };
+    if (pill) pill.update({ icon: button.icon, title: button.title, label: button.label });
     else {
-      const button: PluginButton<PluginText> = {
-        icon: "Gauge",
-        title: messages.message("context.title"),
-        label,
-        behavior: { kind: "popover", Content: ContextPopover },
-      };
       contextPills.set(
         agent.id,
         client.addComposerPill({ id: "context", agentId: agent.id, workspaceId: agent.workspace, button }),
@@ -370,6 +408,43 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
           title: messages.message("subagents.pill"),
           label,
           behavior: { kind: "action", onPress: () => openSubagents(agent.id, workspace) },
+        },
+      }),
+    );
+  }
+
+  // ---- Tasks pill ---------------------------------------------------------------------------
+
+  function renderTasksPill(agent: ObservedAgent) {
+    const snapshot = tasksStore.get(agent.id);
+    const steps = snapshot?.steps;
+    if (!agent.workspace || !steps?.length) {
+      tasksPills.get(agent.id)?.remove();
+      tasksPills.delete(agent.id);
+      tasksPillSigs.delete(agent.id);
+      return;
+    }
+    const { done, total } = countSteps(steps);
+    const label = `${done}/${total}`;
+    const sig = `${agent.workspace}|${label}`;
+    const pill = tasksPills.get(agent.id);
+    if (pill && tasksPillSigs.get(agent.id) === sig) return;
+    tasksPillSigs.set(agent.id, sig);
+    if (pill) {
+      pill.update({ label });
+      return;
+    }
+    tasksPills.set(
+      agent.id,
+      client.addComposerPill({
+        id: "tasks",
+        agentId: agent.id,
+        workspaceId: agent.workspace,
+        button: {
+          icon: "ListChecks",
+          title: messages.message("tasks.title"),
+          label,
+          behavior: { kind: "popover", Content: TasksPopover },
         },
       }),
     );
@@ -531,6 +606,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
   }
 
+  // Preserved lazy orchestrator loading (4a36703): only query when an Orchestrator agent exists.
   let orchestratorLoading = false;
   function hasOrchestratorAgent(): boolean {
     for (const agent of agents.values()) {
@@ -552,10 +628,69 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
   }
   const orchestratorTimer = setInterval(() => {
-    if (orchestrator !== null || hasOrchestratorAgent()) {
+    if (orchestrator !== undefined || hasOrchestratorAgent()) {
       void readOrchestrator();
     }
   }, 10 * 60_000);
+
+  // ---- Tasks polling ------------------------------------------------------------------------
+
+  const pendingTaskAgents = new Set<string>();
+  const readingTasks = new Map<string, number>();
+  const confirmAfterSwitch = new Set<string>();
+  async function refreshTasks(ids: Iterable<string>) {
+    for (const batch of chunk([...new Set(ids)], POLL_BATCH_SIZE)) {
+      if (lifetime.signal.aborted) return;
+      const startGen = new Map<string, number>();
+      for (const id of batch) {
+        if (!agents.has(id)) continue;
+        const gen = sessionGen.get(id) ?? 0;
+        if (readingTasks.get(id) === gen) {
+          pendingTaskAgents.add(id);
+        } else {
+          readingTasks.set(id, gen);
+          startGen.set(id, gen);
+          pendingTaskAgents.delete(id);
+        }
+      }
+      if (!startGen.size) continue;
+      const agentIds = [...startGen.keys()];
+      const response = await client.rpc(agentTasksRpc, { agentIds }).catch(() => null);
+      if (lifetime.signal.aborted) return;
+      const retry: string[] = [];
+      for (const [id, gen] of startGen) {
+        if (readingTasks.get(id) !== gen) continue;
+        readingTasks.delete(id);
+        const agent = agents.get(id);
+        if (!agent || (sessionGen.get(id) ?? 0) !== gen) continue;
+        const snapshot = response?.tasks[id];
+        if (snapshot !== undefined && !response?.unavailable?.includes(id)) {
+          // The first RPC may join a host refresh already in flight at the switch.
+          // Confirm a nonempty result once that shared refresh has completed.
+          if (confirmAfterSwitch.delete(id) && snapshot !== null) {
+            pendingTaskAgents.add(id);
+          } else {
+            const previous = tasksStore.get(id);
+            tasksStore.set(id, snapshot);
+            if (previous !== tasksStore.get(id)) renderTasksPill(agent);
+          }
+        }
+        if (pendingTaskAgents.delete(id)) retry.push(id);
+      }
+      if (retry.length) void refreshTasks(retry);
+    }
+  }
+
+  let tasksTimer: Timer | undefined;
+  function syncTasksSoon() {
+    if (tasksTimer !== undefined || lifetime.signal.aborted) return;
+    tasksTimer = setTimeout(() => {
+      tasksTimer = undefined;
+      void refreshTasks([...agents.values()].filter((agent) => agent.workspace).map((agent) => agent.id));
+    }, 400);
+  }
+
+  // ---- Context & Subagents polling ----------------------------------------------------------
 
   let polling = false;
   async function pollContext(forceAll = false) {
@@ -570,16 +705,22 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       }
     }
     if (polling || lifetime.signal.aborted || due.length === 0) return;
+    void refreshTasks(due);
     polling = true;
     try {
       for (const batch of chunk(due, POLL_BATCH_SIZE)) {
         if (lifetime.signal.aborted) break;
+        const startGen = new Map(batch.map((id) => [id, sessionGen.get(id) ?? 0]));
         const [contextRes, subagentRes] = await Promise.all([
           client.rpc(contextUsageRpc, { agentIds: batch }),
           client.rpc(subagentCountsRpc, { agentIds: batch }).catch(() => null),
         ]);
+        if (lifetime.signal.aborted) break;
         const nativeSet = new Set(contextRes.native);
         for (const id of batch) {
+          // Guard against writing back to agents that were archived or removed while the RPC was in flight.
+          const agent = agents.get(id);
+          if (!agent || (sessionGen.get(id) ?? 0) !== startGen.get(id)) continue;
           lastPolledAt.set(id, Date.now());
           const prevNative = nativeContext.has(id);
           const nextNative = nativeSet.has(id);
@@ -600,9 +741,10 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
                 prevUsage.output !== nextUsage.output ||
                 prevUsage.sizeSource !== nextUsage.sizeSource ||
                 prevUsage.updatedAt !== nextUsage.updatedAt ||
-                prevUsage.model !== nextUsage.model));
-          if (usageChanged) {
-            contextStore.set(id, nextUsage);
+                prevUsage.model !== nextUsage.model ||
+                !sameSession(prevUsage.session, nextUsage.session)));
+          if (usageChanged || nativeChanged) {
+            contextStore.set(id, nextUsage, nextNative);
           }
 
           // Only overwrite subagent counts when the RPC succeeded, avoiding flicker on transient failures.
@@ -620,14 +762,15 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
               subagentChanged = true;
             }
           }
-          const agent = agents.get(id);
-          if (agent) {
-            if (nativeChanged || usageChanged || (!nextNative && !contextPills.has(id))) {
-              renderContextPill(agent);
-            }
-            if (subagentChanged) {
-              renderSubagentPill(agent);
-            }
+          if (
+            nativeChanged ||
+            usageChanged ||
+            (!contextPills.has(id) && contextLabel(nextUsage, nextNative) !== null)
+          ) {
+            renderContextPill(agent);
+          }
+          if (subagentChanged) {
+            renderSubagentPill(agent);
           }
         }
       }
@@ -686,7 +829,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     const nextSignature = next.accounts
       .map((a) => `${a.id}:${a.status}:${a.email ?? ""}:${JSON.stringify(a.orchestratorOverride)}`)
       .join("|");
-    if (accountSignature && nextSignature !== accountSignature && (orchestrator !== null || hasOrchestratorAgent())) {
+    if (accountSignature && nextSignature !== accountSignature && (orchestrator !== undefined || hasOrchestratorAgent())) {
       void readOrchestrator(true);
     }
     accountSignature = nextSignature;
@@ -734,6 +877,9 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
 
   function remove(id: string): boolean {
     const had = agents.delete(id);
+    if (had) sessionGen.set(id, (sessionGen.get(id) ?? 0) + 1);
+    confirmAfterSwitch.delete(id);
+    pendingTaskAgents.delete(id);
     accountPills.get(id)?.remove();
     accountPills.delete(id);
     accountPillSigs.delete(id);
@@ -743,6 +889,9 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     subagentPills.get(id)?.remove();
     subagentPills.delete(id);
     subagentPillSigs.delete(id);
+    tasksPills.get(id)?.remove();
+    tasksPills.delete(id);
+    tasksPillSigs.delete(id);
     orchestratorPills.get(id)?.remove();
     orchestratorPills.delete(id);
     orchestratorPillSigs.delete(id);
@@ -751,6 +900,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     lastPolledAt.delete(id);
     nativeContext.delete(id);
     contextStore.delete(id);
+    tasksStore.delete(id);
     return had;
   }
 
@@ -758,6 +908,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
     const member: ObservedAgent = {
       id: row.id,
+      sessionKey: persistenceSessionKey(row.persistence),
       workspace: row.workspaceId ?? null,
       account: accountIdFromMetadata(row.metadata),
       running: row.status === "running" || row.status === "initializing",
@@ -768,14 +919,16 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (!member.running || (old && old.account !== member.account)) {
       scheduledSwitches.delete(row.id);
     }
-    // A status change usually means a turn started or ended: context changes then.
-    if (!old || old.running !== member.running) {
+    const sessionChanged = old !== undefined && old.sessionKey !== member.sessionKey;
+    // A status or session change usually means a turn started/ended or switched: context/tasks change then.
+    if (!old || sessionChanged || old.running !== member.running) {
       lastPolledAt.delete(row.id);
       const delay = initialSnapshotPolled ? LIVE_POLL_DELAY_MS : STARTUP_POLL_DELAY_MS;
       pollSoon(false, delay);
     }
     if (
       old &&
+      !sessionChanged &&
       old.workspace === member.workspace &&
       old.account === member.account &&
       old.running === member.running &&
@@ -786,6 +939,13 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
     if (old && old.workspace !== member.workspace) remove(row.id);
     agents.set(row.id, member);
+    if (sessionChanged) {
+      sessionGen.set(row.id, (sessionGen.get(row.id) ?? 0) + 1);
+      confirmAfterSwitch.add(row.id);
+      tasksStore.delete(row.id);
+    }
+    renderTasksPill(member);
+    if (sessionChanged) void refreshTasks([row.id]);
     renderAccountPill(member);
     renderContextPill(member);
     renderSubagentPill(member);
@@ -798,27 +958,100 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   }
 
   let reconnect: Timer | undefined;
+  async function subscribeToAgents() {
+    const options = { subscribe: {}, signal: lifetime.signal };
+    try {
+      const { subscription } = await client.paseo.agents.list({ ...options, filter: { includeBackground: true } });
+      return { subscription, includeBackground: true };
+    } catch (error) {
+      if (lifetime.signal.aborted || !isUnsupportedBackgroundFilterError(error)) throw error;
+      const { subscription } = await client.paseo.agents.list(options);
+      return { subscription, includeBackground: false };
+    }
+  }
+
   async function observe() {
     try {
-      const { subscription } = await client.paseo.agents.list({ subscribe: {}, signal: lifetime.signal });
+      const { subscription, includeBackground } = await subscribeToAgents();
       if (lifetime.signal.aborted) return;
+      let snapshotGen = 0;
+      let paging: { gen: number; touched: Set<string>; removed: Set<string> } | null = null;
       subscription.subscribe({
-        snapshot({ entries }) {
+        async snapshot({ entries, pageInfo }) {
           if (lifetime.signal.aborted) return;
+          const gen = ++snapshotGen;
           let changed = false;
-          const ids = new Set(entries.map(({ agent }) => agent.id));
-          for (const id of agents.keys()) {
-            if (!ids.has(id) && remove(id)) changed = true;
-          }
+          const seenIds = new Set(entries.map(({ agent }) => agent.id));
           for (const { agent } of entries) {
             if (upsert(agent)) changed = true;
           }
+          if (!pageInfo?.hasMore || !pageInfo.nextCursor) {
+            paging = null;
+            for (const id of agents.keys()) {
+              if (!seenIds.has(id) && remove(id)) changed = true;
+            }
+            if (changed || counts === null) publishAgents();
+            return;
+          }
+          const activePaging = { gen, touched: new Set<string>(), removed: new Set<string>() };
+          paging = activePaging;
           if (changed || counts === null) publishAgents();
+          const current = () => snapshotGen === activePaging.gen && !lifetime.signal.aborted;
+          const seenCursors = new Set<string>();
+          let cursor = pageInfo.nextCursor;
+          let filtered = includeBackground;
+          let pagedChanged = false;
+          try {
+            while (current()) {
+              if (seenCursors.has(cursor)) throw new Error("Repeated agent directory cursor");
+              seenCursors.add(cursor);
+              const options = { page: { limit: 200, cursor }, signal: lifetime.signal };
+              let page;
+              try {
+                page = await client.paseo.agents.list(filtered ? { ...options, filter: { includeBackground: true } } : options);
+              } catch (error) {
+                if (!current() || !filtered || !isUnsupportedBackgroundFilterError(error)) throw error;
+                filtered = false;
+                page = await client.paseo.agents.list(options);
+              }
+              if (!current()) return;
+              for (const { agent } of page.entries) {
+                seenIds.add(agent.id);
+                if (!activePaging.touched.has(agent.id) && !activePaging.removed.has(agent.id) && upsert(agent)) {
+                  pagedChanged = true;
+                }
+              }
+              if (!page.pageInfo.hasMore) break;
+              if (!page.pageInfo.nextCursor) throw new Error("Missing agent directory cursor");
+              cursor = page.pageInfo.nextCursor;
+            }
+            if (!current()) return;
+            for (const id of agents.keys()) {
+              if (!seenIds.has(id) && !activePaging.touched.has(id) && remove(id)) pagedChanged = true;
+            }
+          } catch (error) {
+            if (!current()) return;
+            console.warn("[antigravity-accounts] agent directory pagination failed", error);
+          } finally {
+            if (paging === activePaging) {
+              paging = null;
+              if (current() && (pagedChanged || counts === null)) publishAgents();
+            }
+          }
         },
         update(message) {
           if (lifetime.signal.aborted || message.type !== "agent_update") return;
           const update = message.payload;
-          const changed = update.kind === "remove" ? remove(update.agentId) : upsert(update.agent);
+          let changed: boolean;
+          if (update.kind === "remove") {
+            paging?.removed.add(update.agentId);
+            paging?.touched.delete(update.agentId);
+            changed = remove(update.agentId);
+          } else {
+            paging?.touched.add(update.agent.id);
+            paging?.removed.delete(update.agent.id);
+            changed = upsert(update.agent);
+          }
           if (changed) publishAgents();
         },
       });
@@ -846,7 +1079,6 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       const input = args.trim().toLowerCase();
       if (!input) {
         const curAccount = list.find((account) => account.id === current);
-        const now = Date.now();
         return notify(
           client.i18n.t(messages, "choices", {
             label: curAccount ? nameOf(curAccount.label, curAccount.kind) : current,
@@ -854,15 +1086,14 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
               .map((account, index) => {
                 const label = nameOf(account.label, account.kind);
                 const unavailable = !account.usable || account.status === "signed-out";
-                const quotaText = !unavailable
-                  ? formatPoolQuota(poolQuotaInfo(account.quota, agent.model, now), client.i18n.locale)
-                  : null;
-                const suffix = unavailable
-                  ? ` (${client.i18n.t(messages, `status.${account.status}`)})`
-                  : quotaText
-                    ? ` (${quotaText})`
-                    : "";
-                return `${index + 1}. ${label}${suffix}`;
+                const quota = !unavailable ? compactQuotaSummary(account, agent.model, client.i18n.locale) : null;
+                const extras = [
+                  account.note,
+                  unavailable ? client.i18n.t(messages, `status.${account.status}`) : quota,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return `${index + 1}. ${label}${extras ? ` (${extras})` : ""}`;
               })
               .join("\n"),
           }),
@@ -893,6 +1124,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       orchestrator = state;
       const member = agents.get(agent.id) ?? {
         id: agent.id,
+        sessionKey: null,
         workspace: agent.workspaceId ?? null,
         account: accountIdFromMetadata(agent.metadata),
         running: agent.status === "running" || agent.status === "initializing",
@@ -975,6 +1207,8 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       };
     },
     refreshContext: () => pollContext(true),
+    /** Debounced fast sync triggered when a timeline `update_steps` call completes. */
+    syncTasksSoon,
     /** Settings changed elsewhere (the console screen): redraw the Orchestrator pills. */
     setOrchestrator(state: OrchestratorState) {
       orchestrator = state;
@@ -986,6 +1220,10 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       clearTimeout(reconnect);
       clearTimeout(soon);
       clearTimeout(cooldownTimer);
+      clearTimeout(tasksTimer);
+      pendingTaskAgents.clear();
+      confirmAfterSwitch.clear();
+      readingTasks.clear();
       clearInterval(contextTimer);
       clearInterval(orchestratorTimer);
       slashAccount();
@@ -993,22 +1231,27 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       accountPills.forEach((pill) => pill.remove());
       contextPills.forEach((pill) => pill.remove());
       subagentPills.forEach((pill) => pill.remove());
+      tasksPills.forEach((pill) => pill.remove());
       orchestratorPills.forEach((pill) => pill.remove());
       accountPills.clear();
       contextPills.clear();
       subagentPills.clear();
+      tasksPills.clear();
       orchestratorPills.clear();
       accountPillSigs.clear();
       contextPillSigs.clear();
       subagentPillSigs.clear();
+      tasksPillSigs.clear();
       orchestratorPillSigs.clear();
       subagentCounts.clear();
       scheduledSwitches.clear();
       lastPolledAt.clear();
+      sessionGen.clear();
       agents.clear();
       listeners.clear();
       presenters.clear();
       contextStore.clear();
+      tasksStore.clear();
       pendingNotice = undefined;
     },
   };

@@ -1,13 +1,21 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type {
-  SubagentArtifactInfo,
-  SubagentDetail,
-  SubagentList,
-  SubagentState,
-  SubagentSummary,
-  TranscriptEntry,
+import { deserialize, serialize } from "node:v8";
+import { promisify } from "node:util";
+import { deflateRaw, inflateRaw } from "node:zlib";
+import { StringDecoder } from "node:string_decoder";
+import {
+  parseUpdateStepsInput,
+  type SubagentArtifactInfo,
+  type SubagentDetail,
+  type SubagentList,
+  type SubagentState,
+  type SubagentSummary,
+  type TaskSnapshot,
+  type TranscriptEntry,
 } from "../shared/contracts";
+import { decodeTextPrefix, readSafeRelativeFile, scanBrainFiles, spend, splitArtifactPath, withSafeRelativeFile, type ScanBudget } from "./artifacts";
+import { readTranscriptHeadFromHandle } from "./transcriptHead";
 import type { ContextReader } from "./context";
 import { REAL_CLI_DIR } from "./paths";
 import type { PaseoApi } from "./types";
@@ -28,7 +36,10 @@ const MAX_DEPTH = 3;
 const MAX_ENTRIES = 300;
 const MAX_LOG_CACHE = 120;
 const MAX_LIST_CACHE = 250;
-const CHILD_CONCURRENCY = 6;
+const FILE_CACHE_BYTES = 512 * 1024;
+const TOTAL_CACHE_BYTES = 2 * 1024 * 1024;
+const pack = promisify(deflateRaw);
+const unpack = promisify(inflateRaw);
 const MAX_ARTIFACT_BYTES = 256 * 1024;
 /** Step states agy may still rewrite in place. */
 const UNFINISHED = new Set(["RUNNING", "PENDING", "GENERATING", "WAITING", "QUEUED"]);
@@ -65,30 +76,40 @@ interface Child {
 }
 
 interface CachedLog {
+  ino: number;
+  dev: number;
   size: number;
   mtimeMs: number;
   rows: Row[];
   /** Byte offset where each row's line starts. */
   starts: number[];
-  children?: Child[];
 }
 
-async function mapConcurrent<T, R>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (;;) {
-      const index = cursor++;
-      if (index >= items.length) return;
-      results[index] = await fn(items[index]!);
-    }
-  });
-  await Promise.all(workers);
-  return results;
+type FileStamp = Pick<CachedLog, "ino" | "dev" | "size" | "mtimeMs">;
+type PackedLog = FileStamp & { payload: Buffer; compressed: boolean; estimatedBytes: number };
+type LightStep = Pick<Row, "step_index" | "type" | "status"> & {
+  lineStart: number;
+  // An appended revision can cross a future rewind point. Keep the earlier projection to restore its slot.
+  previousVersion?: LightStep;
+  // Preserve argument positions so each checklist pairs with its own tool result.
+  updateStepsCalls?: (TaskSnapshot["steps"] | null | undefined)[];
+};
+type TaskCursor = { offset: number; anchorStart: number; anchorBytes: Buffer };
+type TaskLog = TaskCursor & {
+  file: string; ino: number; dev: number; mtimeMs: number;
+  earliestMutableOffset: number | null;
+  steps: Map<number, LightStep>;
+  latest: TaskSnapshot | null; cleared: boolean;
+  unavailable: boolean;
+};
+
+const ANCHOR_BYTES = 128;
+
+async function matchesAnchor(handle: fs.FileHandle, cursor: TaskCursor) {
+  if (!cursor.offset) return true;
+  const bytes = Buffer.alloc(cursor.anchorBytes.length);
+  const { bytesRead } = await handle.read(bytes, 0, bytes.length, cursor.anchorStart);
+  return bytesRead === bytes.length && bytes.equals(cursor.anchorBytes);
 }
 
 function brainDir(conversationId: string): string {
@@ -193,13 +214,6 @@ function messageBody(content: string): string {
   return (request ?? content).trim();
 }
 
-/** Whether a conversation's first message came from `parentId` (agy names the sender). */
-function sentBy(rows: readonly Row[], parentId: string): boolean | null {
-  const first = rows.find((row) => row.type === "SYSTEM_MESSAGE" || row.type === "USER_INPUT");
-  if (!first?.content) return null;
-  return first.content.includes(`sender=${parentId}`);
-}
-
 /** Roles and types `manage_subagents` listed, by conversation id. */
 function listedRoles(content: string): Map<string, { role: string | null; type: string | null }> {
   const result = new Map<string, { role: string | null; type: string | null }>();
@@ -229,68 +243,24 @@ function parseTime(iso: string | null | undefined): number {
 
 /** Lists user-facing artifact files saved directly under a subagent's brain directory. */
 async function listArtifacts(conversationId: string): Promise<SubagentArtifactInfo[]> {
-  const root = brainDir(conversationId);
-  const rootStat = await fs.lstat(root).catch(() => null);
-  if (!rootStat?.isDirectory()) return [];
-  const found: SubagentArtifactInfo[] = [];
-  async function walk(dir: string, depth: number): Promise<void> {
-    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (entry.isSymbolicLink() || entry.name.startsWith(".")) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (depth < 2) await walk(full, depth + 1);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      if (entry.name.endsWith(".metadata.json") || entry.name.endsWith(".resolved")) continue;
-      const stat = await fs.stat(full).catch(() => null);
-      if (!stat) continue;
-      const rel = path.relative(root, full).split(path.sep).join("/");
-      found.push({
-        path: rel,
-        name: entry.name,
-        size: stat.size,
-        updatedAt: new Date(stat.mtimeMs).toISOString(),
-        isMarkdown: /\.(md|markdown)$/i.test(entry.name),
-      });
-    }
-  }
-  await walk(root, 0);
-  return found.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 40);
+  const files = await scanBrainFiles(conversationId, "subagent", null, 40);
+  return files.map(({ path, name, size, updatedAt, kind }) => ({
+    path, name, size, updatedAt, isMarkdown: kind === "markdown",
+  }));
 }
 
 export class SubagentReader {
-  private readonly logs = new Map<string, CachedLog>();
-  private readonly reportsCache = new Map<
-    string,
-    { mtimeMs: number; reports: Map<string, { at: string | null; content: string }> }
-  >();
+  private readonly logs = new Map<string, PackedLog>();
   private readonly listCache = new Map<string, { at: number; value: SubagentList }>();
-  private readonly listInflight = new Map<string, Promise<SubagentList>>();
+  private disposed = false;
+  private readonly agentGen = new Map<string, number>();
+  private readonly inFlightCount = new Map<string, number>();
+  private readonly taskLogs = new Map<string, TaskLog>();
+  private readonly taskSeq = new Map<string, number>();
+  private readonly appliedTaskSeq = new Map<string, number>();
+  private readonly latestRoot = new Map<string, { seq: number; file: string }>();
 
   constructor(private readonly agents: ContextReader) {}
-
-  private rememberLog(file: string, entry: CachedLog): void {
-    this.logs.delete(file);
-    this.logs.set(file, entry);
-    if (this.logs.size > MAX_LOG_CACHE) {
-      const oldest = this.logs.keys().next().value;
-      if (oldest) this.logs.delete(oldest);
-    }
-  }
-
-  private rememberReports(
-    dir: string,
-    entry: { mtimeMs: number; reports: Map<string, { at: string | null; content: string }> },
-  ): void {
-    this.reportsCache.delete(dir);
-    this.reportsCache.set(dir, entry);
-    if (this.reportsCache.size > MAX_LOG_CACHE) {
-      const oldest = this.reportsCache.keys().next().value;
-      if (oldest) this.reportsCache.delete(oldest);
-    }
-  }
 
   private rememberList(agentId: string, entry: { at: number; value: SubagentList }): void {
     this.listCache.delete(agentId);
@@ -301,18 +271,55 @@ export class SubagentReader {
     }
   }
 
+  private async rememberLog(file: string, log: CachedLog, isCurrent?: () => boolean): Promise<void> {
+    const { rows, starts, ...stamp } = log;
+    let payload = serialize({ rows, starts });
+    const overhead = 256 + 2 * file.length;
+    const compressed = payload.length + overhead > FILE_CACHE_BYTES;
+    if (compressed) payload = await pack(payload);
+    if (this.disposed || isCurrent?.() === false) return;
+    const estimatedBytes = overhead + payload.length;
+    this.logs.delete(file);
+    if (estimatedBytes > FILE_CACHE_BYTES) return;
+    // Copy out of any pooled slab or partially used compression output chunk.
+    const owned = Buffer.allocUnsafeSlow(payload.length);
+    payload.copy(owned);
+    this.logs.set(file, { ...stamp, compressed, estimatedBytes, payload: owned });
+    let bytes = 0;
+    for (const entry of this.logs.values()) bytes += entry.estimatedBytes;
+    for (const [key, entry] of this.logs) {
+      if (this.logs.size <= MAX_LOG_CACHE && bytes <= TOTAL_CACHE_BYTES) break;
+      this.logs.delete(key);
+      bytes -= entry.estimatedBytes;
+    }
+  }
+
   /**
    * Reads a conversation log incrementally. agy appends a line per step and rewrites a step's line
    * while it runs, so reading resumes at the earliest step that may still change.
    */
-  private async rows(conversationId: string): Promise<CachedLog | null> {
+  private async rows(conversationId: string, parentId?: string, isCurrent?: () => boolean): Promise<{ rows: Row[]; mtimeMs: number } | null> {
+    return withSafeRelativeFile(brainDir(conversationId), [".system_generated", "logs", "transcript.jsonl"], true,
+      (handle) => this.readLog(handle, conversationId, parentId, isCurrent)).catch(() => null);
+  }
+
+  private async readLog(handle: fs.FileHandle, conversationId: string, parentId?: string, isCurrent?: () => boolean) {
     const file = logPath(conversationId);
-    const stat = await fs.stat(file).catch(() => null);
-    if (!stat?.isFile()) return null;
-    const cached = this.logs.get(file);
-    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-      this.rememberLog(file, cached);
-      return cached;
+    const stat = await handle.stat();
+    if (this.disposed || isCurrent?.() === false) return null;
+    if (parentId && !await hasParentHeader(handle, parentId)) return null;
+    const previous = this.logs.get(file);
+    let cached: CachedLog | undefined;
+    if (previous?.dev === stat.dev && previous.ino === stat.ino) {
+      const data = deserialize(previous.compressed ? await unpack(previous.payload) : previous.payload) as Pick<CachedLog, "rows" | "starts">;
+      cached = { dev: stat.dev, ino: stat.ino, size: previous.size, mtimeMs: previous.mtimeMs, ...data };
+    }
+    if (cached && previous && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      if (this.logs.get(file) === previous) {
+        this.logs.delete(file);
+        this.logs.set(file, previous);
+      }
+      return { rows: cached.rows, mtimeMs: stat.mtimeMs };
     }
     let keep = 0;
     if (cached?.rows.length) {
@@ -325,21 +332,20 @@ export class SubagentReader {
       }
     }
     const offset = cached?.rows.length ? cached.starts[keep]! : 0;
-    const parsed = await readRows(file, offset, stat.size);
+    const parsed = await readRows(handle, offset, stat.size);
     // The first line read must be the step it resumes at; anything else means the file was rewritten.
-    const aligned =
-      !cached?.rows.length || (parsed !== null && parsed.rows[0]?.step_index === cached.rows[keep]!.step_index);
-    const next: CachedLog = aligned && parsed
-      ? {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          rows: [...(cached?.rows.slice(0, keep) ?? []), ...parsed.rows],
-          starts: [...(cached?.starts.slice(0, keep) ?? []), ...parsed.starts],
-        }
-      : { size: stat.size, mtimeMs: stat.mtimeMs, ...((await readRows(file, 0, stat.size)) ?? { rows: [], starts: [] }) };
+    const aligned = !cached?.rows.length || parsed.rows[0]?.step_index === cached.rows[keep]!.step_index;
+    const next: CachedLog = {
+      dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs,
+      ...(aligned ? {
+        rows: [...(cached?.rows.slice(0, keep) ?? []), ...parsed.rows],
+        starts: [...(cached?.starts.slice(0, keep) ?? []), ...parsed.starts],
+      } : await readRows(handle, 0, stat.size)),
+    };
     dedupe(next);
-    this.rememberLog(file, next);
-    return next;
+    if (this.disposed || isCurrent?.() === false) return null;
+    await this.rememberLog(file, next, isCurrent);
+    return { rows: next.rows, mtimeMs: stat.mtimeMs };
   }
 
   /**
@@ -347,10 +353,9 @@ export class SubagentReader {
    * response gets one result line, in call order, before the next response; an `invoke_subagent`
    * result names the conversation it created.
    */
-  private async children(conversationId: string): Promise<Child[]> {
-    const log = await this.rows(conversationId);
+  private async children(conversationId: string, parentId?: string, isCurrent?: () => boolean, knownLog?: { rows: Row[] }): Promise<Child[]> {
+    const log = knownLog ?? await this.rows(conversationId, parentId, isCurrent);
     if (!log) return [];
-    if (log.children) return log.children;
     const found: Child[] = [];
     const seenIds = new Set<string>();
     const killed = new Map<string, string>();
@@ -403,29 +408,27 @@ export class SubagentReader {
       child.role ??= entry?.role ?? null;
       child.type ??= entry?.type ?? null;
     }
-    log.children = found;
     return found;
   }
 
   /** Messages a conversation received, by sender. */
-  private async reports(conversationId: string): Promise<Map<string, { at: string | null; content: string }>> {
-    const dir = inboxDir(conversationId);
-    const stat = await fs.stat(dir).catch(() => null);
-    if (!stat?.isDirectory()) {
-      this.reportsCache.delete(dir);
-      return new Map();
-    }
-    const cached = this.reportsCache.get(dir);
-    if (cached && cached.mtimeMs === stat.mtimeMs) {
-      this.rememberReports(dir, cached);
-      return cached.reports;
-    }
+  private async reports(conversationId: string, budget?: ScanBudget): Promise<Map<string, { at: string | null; content: string }>> {
     const result = new Map<string, { at: string | null; content: string }>();
-    const names = await fs.readdir(dir).catch(() => [] as string[]);
-    for (const name of names) {
+    const dir = inboxDir(conversationId);
+    if (budget && !spend(budget, "dirsLeft")) return result;
+    const entries = await fs.opendir(dir).catch(() => null);
+    if (!entries) return result;
+    let reads = 0;
+    for await (const { name } of entries) {
+      if (budget && (!spend(budget, "entriesLeft") || reads >= 2 || budget.lstatsLeft < 80)) break;
       if (!name.endsWith(".json") || name === "read.json") continue;
+      if (budget && !spend(budget, "lstatsLeft", 12)) break;
+      reads++;
       try {
-        const message = JSON.parse(await fs.readFile(path.join(dir, name), "utf8")) as {
+        const raw = await readSafeRelativeFile(brainDir(conversationId), [".system_generated", "messages", name],
+          MAX_ARTIFACT_BYTES, { allowDotSegments: true, rejectIfTooLarge: true });
+        if (raw.tooLarge) continue;
+        const message = JSON.parse(raw.buffer.toString("utf8")) as {
           sender?: unknown;
           timestamp?: unknown;
           content?: unknown;
@@ -440,7 +443,6 @@ export class SubagentReader {
         // Not a message file.
       }
     }
-    this.rememberReports(dir, { mtimeMs: stat.mtimeMs, reports: result });
     return result;
   }
 
@@ -450,7 +452,7 @@ export class SubagentReader {
     depth: number,
     reported: { at: string | null; content: string } | undefined,
     parentClosed: boolean,
-    log: { rows: Row[]; mtimeMs: number } | null,
+    log: { rows: Row[]; mtimeMs: number },
   ): Promise<SubagentSummary> {
     const rows = log?.rows ?? [];
     let tools = 0;
@@ -536,46 +538,76 @@ export class SubagentReader {
     depth: number,
     parentClosed: boolean,
     out: SubagentSummary[],
+    parentId: string | undefined,
+    isCurrent: () => boolean,
+    budget?: ScanBudget,
+    knownLog?: { rows: Row[]; mtimeMs: number },
   ): Promise<void> {
-    if (depth > MAX_DEPTH) return;
-    const children = await this.children(conversationId);
+    if (depth > MAX_DEPTH || !isCurrent()) return;
+    if (!knownLog && budget && !spend(budget, "lstatsLeft", 12)) return;
+    const children = await this.children(conversationId, parentId, isCurrent, knownLog);
     if (!children.length) return;
-    const inbox = await this.reports(conversationId);
-    const branches = await mapConcurrent(children, CHILD_CONCURRENCY, async (child) => {
+    const inbox = await this.reports(conversationId, budget);
+    for (const child of children) {
       // Only a conversation whose first message came from this parent is its child.
-      const own = await this.rows(child.id);
-      if (own && sentBy(own.rows, conversationId) === false) return null;
+      if (!isCurrent()) return;
+      // Keep enough budget for verifying ownership and walking the actual artifacts.
+      if (budget && (budget.lstatsLeft < 80 || !spend(budget, "lstatsLeft", 14))) break;
+      const own = await this.rows(child.id, conversationId, isCurrent);
+      if (!own) continue;
       const summary = await this.summarize(child, conversationId, depth, inbox.get(child.id), parentClosed, own);
-      const branch: SubagentSummary[] = [summary];
-      await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", branch);
-      return branch;
-    });
-    for (const branch of branches) {
-      if (branch) out.push(...branch);
+      out.push(summary);
+      await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", out, conversationId, isCurrent, budget, own);
     }
   }
 
-  list(paseo: PaseoApi, agentId: string): Promise<SubagentList> {
-    const cached = this.listCache.get(agentId);
-    if (cached && Date.now() - cached.at < 1500) {
-      this.rememberList(agentId, cached);
-      return Promise.resolve(cached.value);
-    }
-    const inflight = this.listInflight.get(agentId);
-    if (inflight) return inflight;
-    const task = (async () => {
-      const info = await this.agents.conversationOf(paseo, agentId);
-      const value: SubagentList = { conversationId: info?.conversationId ?? null, subagents: [] };
-      if (info?.conversationId) {
-        await this.collect(info.conversationId, 1, info.closed, value.subagents);
+  async list(paseo: PaseoApi, agentId: string,
+    options?: ScanBudget | { budget?: ScanBudget; expectedConversationId?: string }): Promise<SubagentList> {
+    if (this.disposed) return { conversationId: null, subagents: [] };
+    const { budget, expectedConversationId } = options && "dirsLeft" in options ? { budget: options } : options ?? {};
+    const gen = this.begin(agentId);
+    try {
+      const info = await this.agents.conversationOf(paseo, agentId, { fresh: true });
+      const conversationId = info?.conversationId ?? null;
+      if (this.disposed || this.agentGen.get(agentId) !== gen ||
+          (expectedConversationId && expectedConversationId !== conversationId)) {
+        return { conversationId, subagents: [] };
       }
-      this.rememberList(agentId, { at: Date.now(), value });
+      const cached = this.listCache.get(agentId);
+      if (cached && cached.value.conversationId === conversationId && Date.now() - cached.at < 1500) {
+        this.rememberList(agentId, cached);
+        return cached.value;
+      }
+      if (cached) this.listCache.delete(agentId);
+      const value: SubagentList = { conversationId, subagents: [] };
+      if (conversationId && info) {
+        await this.collect(conversationId, 1, info.closed, value.subagents, undefined,
+          () => !this.disposed && this.agentGen.get(agentId) === gen, budget);
+        const latest = await this.agents.conversationOf(paseo, agentId, { fresh: true });
+        if (latest?.conversationId !== conversationId) return { conversationId: latest?.conversationId ?? null, subagents: [] };
+      }
+      if (this.disposed || this.agentGen.get(agentId) !== gen) return { conversationId: null, subagents: [] };
+      if (!budget) this.rememberList(agentId, { at: Date.now(), value });
       return value;
-    })().finally(() => {
-      if (this.listInflight.get(agentId) === task) this.listInflight.delete(agentId);
-    });
-    this.listInflight.set(agentId, task);
-    return task;
+    } finally {
+      this.end(agentId);
+    }
+  }
+
+  private begin(agentId: string): number {
+    const gen = this.agentGen.get(agentId) ?? 0;
+    this.agentGen.set(agentId, gen);
+    this.inFlightCount.set(agentId, (this.inFlightCount.get(agentId) ?? 0) + 1);
+    return gen;
+  }
+
+  private end(agentId: string): void {
+    const count = this.inFlightCount.get(agentId) ?? 0;
+    if (count > 1) this.inFlightCount.set(agentId, count - 1);
+    else {
+      this.inFlightCount.delete(agentId);
+      this.agentGen.delete(agentId);
+    }
   }
 
   async counts(paseo: PaseoApi, agentIds: readonly string[]): Promise<Record<string, { total: number; running: number }>> {
@@ -593,16 +625,157 @@ export class SubagentReader {
     return result;
   }
 
+  /**
+   * Verifies that `childId` belongs to `agentId`'s subagent tree AND that every link from `childId`
+   * back to the root conversation is cryptographically/explicitly confirmed by `sender=<parentId>`
+   * in each child's own transcript (refusing unverified ownership).
+   */
+  async isVerifiedChild(paseo: PaseoApi, agentId: string, childId: string, budget?: ScanBudget,
+    expectedRootId?: string, knownList?: SubagentList): Promise<boolean> {
+    const rootId = (await this.agents.conversationOf(paseo, agentId, { fresh: true }))?.conversationId;
+    if (!rootId || childId === rootId || (expectedRootId && expectedRootId !== rootId)) return false;
+    const list = knownList ?? await this.list(paseo, agentId, { budget, expectedConversationId: rootId });
+    if (list.conversationId !== rootId) return false;
+    const byId = new Map(list.subagents.map((sub) => [sub.id, sub]));
+    let cursor = childId;
+    const chain: SubagentSummary[] = [];
+    while (cursor !== rootId) {
+      if (chain.length >= MAX_DEPTH) return false;
+      const entry = byId.get(cursor);
+      if (!entry) return false;
+      chain.push(entry);
+      cursor = entry.parentId;
+    }
+    for (const entry of chain.reverse()) {
+      if (budget && !spend(budget, "lstatsLeft", 12)) return false;
+      const verified = await withSafeRelativeFile(brainDir(entry.id), [".system_generated", "logs", "transcript.jsonl"],
+        true, (handle) => hasParentHeader(handle, entry.parentId)).catch(() => false);
+      if (!verified) return false;
+    }
+    return (await this.agents.conversationOf(paseo, agentId, { fresh: true }))?.conversationId === rootId;
+  }
+
+  private async latestTask(paseo: PaseoApi, agentId: string): Promise<TaskSnapshot | null | undefined> {
+    if (this.disposed) return undefined;
+    const seq = (this.taskSeq.get(agentId) ?? 0) + 1;
+    this.taskSeq.set(agentId, seq);
+    const gen = this.begin(agentId);
+    const current = () => !this.disposed && this.agentGen.get(agentId) === gen;
+    const atStart = this.taskLogs.get(agentId);
+    const canApply = (targetFile?: string) => {
+      if (seq < (this.appliedTaskSeq.get(agentId) ?? 0)) return false;
+      const root = this.latestRoot.get(agentId);
+      return !root || root.seq <= seq || root.file === targetFile;
+    };
+    try {
+      const info = await this.agents.conversationOf(paseo, agentId, { fresh: true });
+      if (!current() || !info) return undefined;
+      if (!info.conversationId) {
+        const previous = canApply() ? this.taskLogs.get(agentId) : atStart;
+        return previous ? undefined : null;
+      }
+      const file = logPath(info.conversationId);
+      if (seq >= (this.latestRoot.get(agentId)?.seq ?? 0)) this.latestRoot.set(agentId, { seq, file });
+      const previous = canApply(file) ? this.taskLogs.get(agentId) : atStart;
+      const sameConversation = previous?.file === file;
+      const prior = sameConversation ? previous : undefined;
+      try {
+        return await withSafeRelativeFile(brainDir(info.conversationId), [".system_generated", "logs", "transcript.jsonl"], true,
+          async (handle) => {
+            const before = await handle.stat();
+            if (!current()) return undefined;
+            const sameFile = prior && prior.ino === before.ino && prior.dev === before.dev;
+            if (sameFile && prior.offset === before.size && prior.mtimeMs === before.mtimeMs &&
+                (!canApply(file) || this.taskLogs.get(agentId) === prior)) {
+              // A cache hit also confirms this session ahead of any slower requests.
+              if (canApply(file)) this.appliedTaskSeq.set(agentId, seq);
+              return prior.unavailable ? undefined : prior.latest;
+            }
+            const resume = sameFile && before.size >= prior.offset &&
+              (before.size > prior.offset || prior.earliestMutableOffset !== null) && await matchesAnchor(handle, prior);
+            const scanFrom = resume ? prior.earliestMutableOffset ?? prior.offset : 0;
+            const steps = new Map(resume ? prior.steps : undefined);
+            if (resume && scanFrom < prior.offset) {
+              for (const [index, latest] of steps) {
+                let step: LightStep | undefined = latest;
+                while (step && step.lineStart >= scanFrom) step = step.previousVersion;
+                if (!step) steps.delete(index);
+                else if (step !== latest) steps.set(index, step);
+              }
+            }
+            const cursor: TaskCursor = resume && scanFrom === prior.offset
+              ? { offset: scanFrom, anchorStart: prior.anchorStart, anchorBytes: prior.anchorBytes }
+              : { offset: scanFrom, anchorStart: scanFrom, anchorBytes: Buffer.alloc(0) };
+            const finishTail = await scanRows(handle, scanFrom, before.size, (row, lineStart) => {
+              const updateStepsCalls = row.tool_calls?.map(call =>
+                call.name === "update_steps" ? parseUpdateStepsInput(call.args) : undefined);
+              steps.set(row.step_index, { step_index: row.step_index, type: row.type, status: row.status,
+                lineStart, updateStepsCalls, previousVersion: steps.get(row.step_index) });
+            }, cursor);
+            const after = await handle.stat();
+            if (before.ino !== after.ino || before.dev !== after.dev || after.size < cursor.offset) return undefined;
+            if (after.size === before.size && after.mtimeMs === before.mtimeMs) finishTail?.();
+            if (!await matchesAnchor(handle, cursor)) return undefined;
+            // fstat follows the open inode even after the transcript path is replaced.
+            const linked = await fs.lstat(file).catch(() => null);
+            if (!linked || linked.ino !== after.ino || linked.dev !== after.dev || linked.size < cursor.offset ||
+                !current()) return undefined;
+            const { result, earliestMutableOffset } = inspectTaskSteps([...steps.values()]);
+            const committed = canApply(file) ? this.taskLogs.get(agentId) : undefined;
+            const baseline = committed?.file === file ? committed : prior;
+            const cleared = result.kind === "cleared" || (result.kind === "none" && baseline?.cleared === true);
+            const latest = result.kind === "snapshot" ? result.snapshot : cleared ? null : baseline?.latest ?? null;
+            const unavailable = result.kind === "none" && latest !== null;
+            if (canApply(file)) {
+              this.appliedTaskSeq.set(agentId, seq);
+              this.taskLogs.set(agentId, { ...cursor, file, ino: before.ino, dev: before.dev,
+                mtimeMs: before.mtimeMs, steps, earliestMutableOffset, latest, cleared, unavailable });
+            }
+            return unavailable ? undefined : latest;
+          });
+      } catch (error) {
+        if (!current()) return undefined;
+        const baseline = canApply(file) ? this.taskLogs.get(agentId) : previous;
+        if (baseline?.file !== file && (baseline || (error as NodeJS.ErrnoException)?.code === "ENOENT")) {
+          if (canApply(file)) {
+            this.appliedTaskSeq.set(agentId, seq);
+            this.taskLogs.delete(agentId);
+          }
+          return null;
+        }
+        return undefined;
+      }
+    } finally {
+      this.end(agentId);
+    }
+  }
+
+  async latestTasks(paseo: PaseoApi, agentIds: readonly string[]) {
+    const tasks: Record<string, TaskSnapshot | null> = Object.create(null);
+    const unavailable: string[] = [];
+    await Promise.all([...new Set(agentIds)].map(async id => {
+      const snapshot = await this.latestTask(paseo, id).catch(() => undefined);
+      if (snapshot === undefined) unavailable.push(id);
+      else tasks[id] = snapshot;
+    }));
+    return { tasks, unavailable };
+  }
+
   async detail(paseo: PaseoApi, agentId: string, subagentId: string): Promise<SubagentDetail> {
     const list = await this.list(paseo, agentId);
     const summary = list.subagents.find((subagent) => subagent.id === subagentId) ?? null;
     // Only conversations this agent created can be read through it.
-    if (!summary) return { summary: null, entries: [], report: null, artifacts: [], truncated: false };
+    if (!summary || !list.conversationId || !await this.isVerifiedChild(paseo, agentId, subagentId, undefined, list.conversationId, list)) {
+      return { summary: null, entries: [], report: null, artifacts: [], truncated: false };
+    }
     const [log, inbox, artifacts] = await Promise.all([
-      this.rows(subagentId),
+      this.rows(subagentId, summary.parentId),
       this.reports(summary.parentId),
       listArtifacts(subagentId),
     ]);
+    if ((await this.agents.conversationOf(paseo, agentId, { fresh: true }))?.conversationId !== list.conversationId) {
+      return { summary: null, entries: [], report: null, artifacts: [], truncated: false };
+    }
     const rows = log?.rows ?? [];
     const entries: TranscriptEntry[] = [];
     const open: TranscriptEntry["tools"] = [];
@@ -682,107 +855,281 @@ export class SubagentReader {
     subagentId: string,
     relativePath: string,
   ): Promise<{ path: string; content: string; truncated: boolean; isMarkdown: boolean }> {
-    const list = await this.list(paseo, agentId);
-    if (!list.subagents.some((subagent) => subagent.id === subagentId)) {
+    if (!UUID.test(subagentId)) throw new Error("Invalid subagent id.");
+    const root = (await this.agents.conversationOf(paseo, agentId, { fresh: true }))?.conversationId;
+    const verified = root && await this.isVerifiedChild(paseo, agentId, subagentId, undefined, root);
+    if (!verified) {
       throw new Error("That subagent does not belong to this agent.");
     }
-    const root = brainDir(subagentId);
-    const rootStat = await fs.lstat(root).catch(() => null);
-    if (!rootStat?.isDirectory()) throw new Error("Artifact could not be read.");
-    const cleaned = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
-    const parts = cleaned.split("/");
-    if (!cleaned || parts.some((part) => !part || part === "." || part === ".." || part.startsWith("."))) {
-      throw new Error("Invalid artifact path.");
+    const { cleaned, segments } = splitArtifactPath(relativePath);
+    const result = await readSafeRelativeFile(brainDir(subagentId), segments, MAX_ARTIFACT_BYTES);
+    if ((await this.agents.conversationOf(paseo, agentId, { fresh: true }))?.conversationId !== root) {
+      throw new Error("That subagent does not belong to this agent.");
     }
-    const target = path.resolve(root, cleaned);
-    if (!target.startsWith(root + path.sep)) throw new Error("Invalid artifact path.");
-    // Verify every segment from root to target is a real directory or file, never a symlink.
-    let current = root;
-    for (let i = 0; i < parts.length; i += 1) {
-      current = path.join(current, parts[i]!);
-      const entryStat = await fs.lstat(current).catch(() => null);
-      if (!entryStat || entryStat.isSymbolicLink()) throw new Error("Artifact could not be read.");
-      if (i < parts.length - 1 ? !entryStat.isDirectory() : !entryStat.isFile()) {
-        throw new Error(i < parts.length - 1 ? "Artifact could not be read." : "Artifact is not a file.");
-      }
-    }
-    const handle = await fs.open(target, "r");
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile()) throw new Error("Artifact is not a file.");
-      const toRead = Math.min(stat.size, MAX_ARTIFACT_BYTES);
-      const buffer = Buffer.alloc(toRead);
-      let filled = 0;
-      while (filled < toRead) {
-        const { bytesRead } = await handle.read(buffer, filled, toRead - filled, filled);
-        if (bytesRead <= 0) break;
-        filled += bytesRead;
-      }
-      return {
-        path: cleaned,
-        content: buffer.subarray(0, filled).toString("utf8"),
-        truncated: stat.size > MAX_ARTIFACT_BYTES,
-        isMarkdown: /\.(md|markdown)$/i.test(cleaned),
-      };
-    } finally {
-      await handle.close().catch(() => undefined);
-    }
+    return {
+      path: cleaned,
+      content: decodeTextPrefix(result),
+      truncated: result.truncated,
+      isMarkdown: /\.(md|markdown)$/i.test(cleaned),
+    };
   }
 
   forget(agentId: string): void {
+    if (this.inFlightCount.has(agentId)) this.agentGen.set(agentId, (this.agentGen.get(agentId) ?? 0) + 1);
+    const file = this.taskLogs.get(agentId);
+    if (file) this.logs.delete(file.file);
+    this.taskLogs.delete(agentId);
+    this.taskSeq.delete(agentId);
+    this.appliedTaskSeq.delete(agentId);
+    this.latestRoot.delete(agentId);
     const cached = this.listCache.get(agentId);
     if (cached) {
-      if (cached.value.conversationId) {
-        this.logs.delete(logPath(cached.value.conversationId));
-        this.reportsCache.delete(inboxDir(cached.value.conversationId));
-      }
-      for (const subagent of cached.value.subagents) {
-        this.logs.delete(logPath(subagent.id));
-        this.reportsCache.delete(inboxDir(subagent.id));
-      }
+      if (cached.value.conversationId) this.logs.delete(logPath(cached.value.conversationId));
+      for (const subagent of cached.value.subagents) this.logs.delete(logPath(subagent.id));
     }
     this.listCache.delete(agentId);
   }
+
+  dispose(): void {
+    this.disposed = true;
+    this.agentGen.clear();
+    this.inFlightCount.clear();
+    this.taskLogs.clear();
+    this.taskSeq.clear();
+    this.appliedTaskSeq.clear();
+    this.latestRoot.clear();
+    this.logs.clear();
+    this.listCache.clear();
+  }
 }
 
-/** Parses the complete lines of `file` between `from` and `to`, with each line's start offset. */
-async function readRows(file: string, from: number, to: number): Promise<{ rows: Row[]; starts: number[] } | null> {
-  const length = Math.max(0, to - from);
-  const buffer = Buffer.alloc(length);
-  const handle = await fs.open(file, "r").catch(() => null);
-  if (!handle) return null;
-  let totalRead = 0;
-  try {
-    while (totalRead < length) {
-      const { bytesRead } = await handle.read(buffer, totalRead, length - totalRead, from + totalRead);
-      if (bytesRead <= 0) break;
-      totalRead += bytesRead;
-    }
-  } finally {
-    await handle.close();
+const CHUNK_BYTES = 64 * 1024;
+const LINE_BYTES = 128 * 1024;
+const PREVIEW_CHARS = 4096;
+const ROW_FIELDS = new Set([
+  "step_index", "type", "status", "created_at", "source", "model",
+  "input_tokens", "output_tokens", "cache_read_tokens", "tool_calls",
+  "tool_call_id", "name", "args", "result", "content", "thinking",
+]);
+
+/** Project a large JSON object one top-level member at a time, in any field order. */
+class LargeRowParser {
+  private readonly fields: Record<string, unknown> = {};
+  private phase: "start" | "key" | "colon" | "value" | "done" = "start";
+  private key = "";
+  private parts: string[] = [];
+  private length = 0;
+  private limit = 0;
+  private nested = 0;
+  private quoted = false;
+  private escaped = false;
+  private clipped = false;
+  private valueStarted = false;
+
+  private append(text: string) {
+    const take = Math.min(text.length, this.limit - this.length);
+    if (take > 0) this.parts.push(text.slice(0, take));
+    this.length += take;
+    if (take < text.length) this.clipped = true;
   }
-  const view = buffer.subarray(0, totalRead);
+
+  private finishValue() {
+    if (this.limit) {
+      let raw = this.parts.join("");
+      if (this.clipped) {
+        // Only content/thinking strings are clipped. Stop at a complete JSON escape.
+        const prefix = /^"((?:[^"\\]|\\(?:u[\da-fA-F]{4}|["\\/bfnrt]))*)/.exec(raw);
+        if (!prefix) throw Error("Invalid transcript string");
+        raw = '"' + prefix[1] + '…"';
+      }
+      this.fields[this.key] = JSON.parse(raw);
+    }
+    this.parts = [];
+    this.length = 0;
+    this.clipped = false;
+    this.valueStarted = false;
+  }
+
+  feed(text: string) {
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i]!;
+      if (this.phase === "value") {
+        if (!this.valueStarted) {
+          if (/\s/.test(c)) { start = i + 1; continue; }
+          this.valueStarted = true;
+          if (c === '"' && (this.key === "content" || this.key === "thinking")) this.limit = PREVIEW_CHARS;
+        }
+        if (!this.quoted && this.nested === 0 && (c === "," || c === "}")) {
+          this.append(text.slice(start, i));
+          this.finishValue();
+          this.phase = c === "," ? "key" : "done";
+        } else if (this.quoted) {
+          if (this.escaped) this.escaped = false;
+          else if (c === "\\") this.escaped = true;
+          else if (c === '"') this.quoted = false;
+        } else if (c === '"') this.quoted = true;
+        else if (c === "[" || c === "{") this.nested++;
+        else if (c === "]" || c === "}") this.nested--;
+        continue;
+      }
+      if (this.phase === "key" && this.quoted) {
+        if (this.key.length < 128) this.key += c;
+        if (this.escaped) this.escaped = false;
+        else if (c === "\\") this.escaped = true;
+        else if (c === '"') {
+          this.key = this.key.length < 128 ? JSON.parse(this.key) as string : "";
+          this.quoted = false;
+          this.phase = "colon";
+        }
+        continue;
+      }
+      if (/\s/.test(c)) continue;
+      if (this.phase === "start" && c === "{") this.phase = "key";
+      else if (this.phase === "key" && c === '"') { this.key = '"'; this.quoted = true; }
+      else if (this.phase === "colon" && c === ":") {
+        this.phase = "value";
+        this.limit = ROW_FIELDS.has(this.key) ? Infinity : 0;
+        start = i + 1;
+      } else throw Error("Invalid transcript object");
+    }
+    if (this.phase === "value") this.append(text.slice(start));
+  }
+
+  finish(): Row {
+    if (this.phase !== "done") throw Error("Incomplete transcript object");
+    return this.fields as unknown as Row;
+  }
+}
+
+async function hasParentHeader(handle: fs.FileHandle, parentId: string) {
+  const head = await readTranscriptHeadFromHandle(handle);
+  return head.complete && head.sender === parentId.toLowerCase();
+}
+
+/** Reuse a single positional read buffer. Promote only oversized lines to the projection parser. */
+async function scanRows(handle: fs.FileHandle, from: number, to: number,
+  visit: (row: Row, start: number) => void, cursor?: TaskCursor) {
+  const chunk = Buffer.allocUnsafe(CHUNK_BYTES);
+  const decoder = new StringDecoder("utf8");
+  let parts: string[] = [];
+  let parser: LargeRowParser | undefined;
+  let invalid = false;
+  let start = from;
+  let tail: Buffer = cursor?.anchorBytes ?? Buffer.alloc(0);
+  function rememberBytes(bytes: Buffer) {
+    if (!bytes.length) return;
+    tail = bytes.length >= ANCHOR_BYTES
+      ? Buffer.from(bytes.subarray(-ANCHOR_BYTES))
+      : Buffer.concat([tail.subarray(Math.max(0, tail.length + bytes.length - ANCHOR_BYTES)), bytes]);
+  }
+  function checkpoint(end: number) {
+    if (!cursor) return;
+    cursor.offset = end;
+    cursor.anchorBytes = tail;
+    cursor.anchorStart = end - tail.length;
+  }
+  function feed(text: string, length: number) {
+    if (invalid) return;
+    try {
+      if (!parser && length > LINE_BYTES) {
+        parser = new LargeRowParser();
+        for (const part of parts) parser.feed(part);
+        parts = [];
+      }
+      if (parser) parser.feed(text);
+      else parts.push(text);
+    } catch {
+      invalid = true;
+    }
+  }
+  function finish(strict = false) {
+    try {
+      if (invalid) throw Error("Invalid transcript object");
+      const text = parser ? "" : parts.join("");
+      if (!parser && !text.trim()) return;
+      const row = parser ? parser.finish() : JSON.parse(text) as Row;
+      if (row && typeof row.step_index === "number") visit(row, start);
+      return true;
+    } catch (error) {
+      if (strict) throw error;
+    } finally {
+      parser = undefined;
+      parts = [];
+      invalid = false;
+    }
+  }
+  for (let offset = from; offset < to;) {
+    const { bytesRead } = await handle.read(chunk, 0, Math.min(CHUNK_BYTES, to - offset), offset);
+    if (!bytesRead) {
+      // Keep completed lines eligible for anchor verification after a concurrent truncation.
+      if (cursor) return;
+      throw Error("Transcript changed during read");
+    }
+    const view = chunk.subarray(0, bytesRead);
+    if (cursor) {
+      const end = view.lastIndexOf(10) + 1;
+      if (end) {
+        rememberBytes(view.subarray(0, end));
+        checkpoint(offset + end);
+      }
+      rememberBytes(view.subarray(end));
+    }
+    let pos = 0;
+    while (pos < bytesRead) {
+      const nl = view.indexOf(10, pos);
+      const end = nl < 0 ? bytesRead : nl;
+      feed(decoder.write(view.subarray(pos, end)), offset + end - start);
+      if (nl < 0) break;
+      feed(decoder.end(), offset + end - start);
+      finish(!!cursor);
+      pos = nl + 1;
+      start = offset + pos;
+    }
+    offset += bytesRead;
+  }
+  if (start < to) {
+    feed(decoder.end(), to - start);
+    if (cursor) return () => { if (finish()) checkpoint(to); };
+    finish();
+  }
+}
+
+function preview(value: string, maxBytes = 4096): string {
+  const prefix = value.slice(0, maxBytes);
+  if (prefix.length === value.length && Buffer.byteLength(prefix) <= maxBytes) return value;
+  const bytes = Buffer.from(prefix).subarray(0, maxBytes - 3);
+  return new TextDecoder().decode(bytes, { stream: true }) + "…";
+}
+
+function detailRow(row: Row): Row {
+  const { step_index, input_tokens, output_tokens, cache_read_tokens } = row;
+  return {
+    step_index, input_tokens, output_tokens, cache_read_tokens,
+    type: row.type && preview(row.type),
+    status: row.status && preview(row.status),
+    created_at: row.created_at && preview(row.created_at),
+    model: row.model && preview(row.model),
+    content: typeof row.content === "string" ? preview(row.content, row.type === "GENERIC" ? 2048 : 4096) : undefined,
+    thinking: typeof row.thinking === "string" ? preview(row.thinking, 2048) : undefined,
+    tool_calls: row.tool_calls?.map(call => ({
+      name: preview(call.name),
+      args: Object.fromEntries(Object.entries(call.args ?? {}).map(([key, value]) => {
+        if (typeof value === "string") return [key, preview(value)];
+        const json = JSON.stringify(value);
+        return [key, json && Buffer.byteLength(json) > 4096 ? preview(json) : value];
+      })),
+    })),
+  };
+}
+
+async function readRows(handle: fs.FileHandle, from: number, to: number) {
   const rows: Row[] = [];
   const starts: number[] = [];
-  let start = 0;
-  for (;;) {
-    const newline = view.indexOf(0x0a, start);
-    // A line without its newline is still being written: leave it for the next read.
-    if (newline < 0) break;
-    const line = view.subarray(start, newline).toString("utf8").trim();
-    if (line) {
-      try {
-        const row = JSON.parse(line) as Row;
-        if (typeof row.step_index === "number") {
-          rows.push(row);
-          starts.push(from + start);
-        }
-      } catch {
-        if (rows.length === 0 && from > 0) return null;
-      }
-    }
-    start = newline + 1;
-  }
+  await scanRows(handle, from, to, (row, start) => {
+    rows.push(detailRow(row));
+    starts.push(start);
+  });
   return { rows, starts };
 }
 
@@ -795,18 +1142,75 @@ function dedupe(log: CachedLog): void {
     seen.add(row.step_index);
   }
   if (!duplicate) return;
+  // An appended status rewrite still belongs to the original planner call. Preserve the
+  // first position (and its resume offset) while keeping the latest version of that step.
   const rows: Row[] = [];
   const starts: number[] = [];
-  const kept = new Set<number>();
-  for (let index = log.rows.length - 1; index >= 0; index -= 1) {
-    const row = log.rows[index]!;
-    if (kept.has(row.step_index)) continue;
-    kept.add(row.step_index);
-    rows.push(row);
-    starts.push(log.starts[index]!);
+  const slots = new Map<number, number>();
+  for (const [index, row] of log.rows.entries()) {
+    const slot = slots.get(row.step_index);
+    if (slot !== undefined) rows[slot] = row;
+    else {
+      slots.set(row.step_index, rows.length);
+      rows.push(row);
+      starts.push(log.starts[index]!);
+    }
   }
-  rows.reverse();
-  starts.reverse();
   log.rows = rows;
   log.starts = starts;
+}
+
+/** Pair result rows with their planner calls in order, starting with the newest response. */
+type ConfirmedTask = { kind: "snapshot"; snapshot: TaskSnapshot } | { kind: "cleared" } | { kind: "none" };
+
+const TERMINAL_TASK_RESULTS = new Set(["DONE", "ERROR", "CANCELED", "CANCELLED", "FAILED"]);
+
+function inspectTaskSteps(rows: LightStep[]) {
+  let result: ConfirmedTask = { kind: "none" };
+  let earliestMutableOffset: number | null = null;
+  let results: LightStep[] = [];
+  let activeTurnFloor = -1;
+  rows.sort((a, b) => a.step_index - b.step_index);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!;
+    if (row.type === "GENERIC" || row.type === "TOOL_RESULT") results.push(row);
+    if (row.type === "USER_INPUT" || row.type === "SYSTEM_MESSAGE") {
+      activeTurnFloor = Math.max(activeTurnFloor, row.step_index);
+      results = [];
+    }
+    if (row.type !== "PLANNER_RESPONSE") continue;
+    const calls = row.updateStepsCalls ?? [];
+    // An older planner can gain arguments after its result is already on disk.
+    // Use the same positional result segment as the confirmation loop below.
+    if (TERMINAL_TASK_RESULTS.has(row.status ?? "")) {
+      activeTurnFloor = Math.max(activeTurnFloor, row.step_index);
+    } else {
+      let start = row.step_index >= activeTurnFloor || calls.some(steps => steps !== undefined)
+        ? row.lineStart : Infinity;
+      for (const candidate of results) {
+        if (candidate.status === "DONE") start = Math.min(start, row.lineStart);
+        else if (!TERMINAL_TASK_RESULTS.has(candidate.status ?? "")) {
+          start = Math.min(start, row.lineStart, candidate.lineStart);
+        }
+      }
+      if (Number.isFinite(start)) earliestMutableOffset = Math.min(earliestMutableOffset ?? start, start);
+    }
+    for (let j = calls.length - 1; j >= 0; j--) {
+      const steps = calls[j];
+      if (steps === undefined) continue;
+      const paired = results[results.length - 1 - j];
+      if (!TERMINAL_TASK_RESULTS.has(paired?.status ?? "")) {
+        const start = Math.min(row.lineStart, paired?.lineStart ?? row.lineStart);
+        earliestMutableOffset = Math.min(earliestMutableOffset ?? start, start);
+      }
+      if (!steps || paired?.status !== "DONE" || result.kind !== "none") continue;
+      const revision = row.step_index * 1000 + j;
+      result = steps.length ? { kind: "snapshot", snapshot: { planId: "steps-" + revision, revision, steps } }
+        : { kind: "cleared" };
+    }
+    // Earlier planners cannot supersede a confirmed checklist, including a confirmed clear.
+    if (result.kind !== "none") return { result, earliestMutableOffset };
+    results = [];
+  }
+  return { result, earliestMutableOffset };
 }

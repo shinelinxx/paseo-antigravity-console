@@ -1,11 +1,17 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import {
   ASK_QUESTION_TIMELINE_KIND,
+  COMPACT_TOOL_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
+  UPDATE_STEPS_TIMELINE_KIND,
+  isUpdateStepsSuccessOutput,
+  parseUpdateStepsInput,
   type AskQuestionCard,
+  type CompactToolCard,
   type SubagentCard,
   type SubagentCheck,
+  type UpdateStepsCard,
 } from "../shared/contracts";
 import {
   extractToolOutput,
@@ -89,13 +95,101 @@ function killedStates(input: unknown, output: unknown): SubagentCheck["states"] 
   }));
 }
 
+function oneLine(text: string, max: number): string {
+  return cut(text.replace(/\s+/g, " ").trim(), max);
+}
+
+/**
+ * Strictly recognizes Antigravity's PascalCase `schedule`, `run_workflow`, and `send_message` inputs.
+ * Returns `null` for non-matching parameter shapes so other providers' tools remain unaltered.
+ */
+function buildCompactTool(
+  name: string,
+  input: unknown,
+  output: unknown,
+  status: CompactToolCard["status"],
+): CompactToolCard | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const record = input as Record<string, unknown>;
+  const rawOutput = extractToolOutput(output);
+  const clippedOutput = rawOutput ? cut(rawOutput.trim(), 1200) : null;
+
+  if (name === "schedule") {
+    const prompt = typeof record.Prompt === "string" ? record.Prompt.trim() : "";
+    const cron = typeof record.CronExpression === "string" ? record.CronExpression.trim() : "";
+    const seconds =
+      typeof record.DurationSeconds === "number" && Number.isFinite(record.DurationSeconds) && record.DurationSeconds >= 0
+        ? record.DurationSeconds
+        : null;
+    // Antigravity's `schedule` always supplies PascalCase Prompt plus CronExpression or DurationSeconds.
+    if (!prompt || (!cron && seconds === null)) return null;
+    return {
+      tool: "schedule",
+      variant: cron ? "cron" : "timer",
+      expr: cron || `${seconds}s`,
+      target: null,
+      label: null,
+      subtitle: oneLine(prompt, 100),
+      detail: cut(prompt, 1200),
+      output: clippedOutput,
+      status,
+    };
+  }
+
+  if (name === "run_workflow") {
+    const scriptPath = typeof record.ScriptPath === "string" ? record.ScriptPath.trim() : "";
+    const script = typeof record.Script === "string" ? record.Script.trim() : "";
+    // Antigravity's `run_workflow` requires either PascalCase Script or ScriptPath.
+    if (!scriptPath && !script) return null;
+    const desc = typeof record.Description === "string" ? record.Description.trim() : "";
+    const scriptName = scriptPath ? scriptPath.split(/[/\\]/).pop() ?? scriptPath : "";
+    return {
+      tool: "run_workflow",
+      variant: "default",
+      expr: scriptName || null,
+      target: null,
+      label: desc ? oneLine(desc, 80) : null,
+      subtitle: desc && scriptName ? scriptName : null,
+      detail: scriptPath || (script ? cut(script, 1600) : null) || (desc ? cut(desc, 1000) : null),
+      output: clippedOutput,
+      status,
+    };
+  }
+
+  if (name === "send_message") {
+    const recipient = typeof record.Recipient === "string" ? record.Recipient.trim() : "";
+    const message = typeof record.Message === "string" ? record.Message.trim() : "";
+    // Antigravity's `send_message` strictly requires PascalCase Recipient and Message.
+    if (!recipient || !message) return null;
+    const shortTarget = UUID.test(recipient) ? recipient.slice(0, 8) : cut(recipient, 32);
+    return {
+      tool: "send_message",
+      variant: "default",
+      expr: null,
+      target: shortTarget,
+      label: null,
+      subtitle: oneLine(message, 100),
+      detail: cut(message, 1600),
+      output: clippedOutput,
+      status,
+    };
+  }
+
+  return null;
+}
+
 /**
  * Antigravity's own timeline rows:
  * - `invoke_subagent` becomes a live card of the child it started;
  * - `manage_subagents` becomes a one-line summary;
- * - `ask_question` becomes an interactive question card (and hides agy's duplicate plain-text list).
+ * - `ask_question` becomes an interactive question card (and hides agy's duplicate plain-text list);
+ * - each update_steps call becomes a compact, expandable progress snapshot;
+ * - `schedule`, `run_workflow`, and `send_message` condense into localized expandable rows.
  */
-export function registerSubagentTransforms(client: PluginClientContext) {
+export function registerSubagentTransforms(
+  client: PluginClientContext,
+  options?: { onStepsToolSeen?: () => void },
+) {
   const knownQuestionEchoes = new Set<string>();
   const echoFirstLines = new Set<string>();
   let maxEchoLength = 0;
@@ -184,6 +278,26 @@ export function registerSubagentTransforms(client: PluginClientContext) {
           status,
         };
         return { items: [{ type: "plugin", kind: ASK_QUESTION_TIMELINE_KIND, version: 1, data }] };
+      }
+      if (item.name === "update_steps" && item.detail.type === "unknown") {
+        if (!item.callId?.trim()) return undefined;
+        const steps = parseUpdateStepsInput(item.detail.input);
+        if (!steps) return undefined;
+        const result = item.detail.output;
+        if (status === "failed" || status === "canceled") {
+          if (result != null && result !== "") return undefined;
+        } else if (!isUpdateStepsSuccessOutput(result)) return undefined;
+        if (status === "completed") options?.onStepsToolSeen?.();
+        const data: UpdateStepsCard = { callId: item.callId, steps, status, error: null };
+        return { items: [{ type: "plugin", kind: UPDATE_STEPS_TIMELINE_KIND, version: 2, data }] };
+      }
+      if (
+        (item.name === "schedule" || item.name === "run_workflow" || item.name === "send_message") &&
+        item.detail.type === "unknown"
+      ) {
+        const data = buildCompactTool(item.name, item.detail.input, item.detail.output, status);
+        if (!data) return undefined;
+        return { items: [{ type: "plugin", kind: COMPACT_TOOL_TIMELINE_KIND, version: 1, data }] };
       }
       return undefined;
     },

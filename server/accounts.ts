@@ -1,19 +1,23 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  AUTO_ACCOUNT_ID,
   SYSTEM_ACCOUNT_ID,
   inferPlanWeight,
+  isAutoAccountId,
   type AccountCooldown,
   type AccountSummary,
   type AccountsState,
+  type DefaultAccountId,
   type FallbackSettings,
+  type FallbackStrategy,
   type OrchestratorChoice,
   type QuotaGroup,
   type RoutingSettings,
   type SavedFiles,
 } from "../shared/contracts";
 import { agyVersion, probeAccount, readAccountEmail, readPlan, type AccountPlan } from "./agy";
-import { dataDir, displayPath, profileHome, resolveAgy } from "./paths";
+import { dataDir, displayPath, resolveAgy } from "./paths";
 import {
   deleteSignIn,
   ensureProfile,
@@ -30,6 +34,52 @@ import { AccountStore, orderedAccountIds, type StoredAccount } from "./store";
 
 const statusFile = () => path.join(dataDir(), "status.json");
 
+export interface QuotaProbeOptions {
+  skipPlan?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export class AccountWaitTimeout extends Error {
+  readonly retryable = true;
+  constructor() {
+    super("Account selection timed out during launch.");
+  }
+}
+
+function abortError(signal: AbortSignal) {
+  const reason = "reason" in signal ? signal.reason : undefined;
+  if (reason instanceof Error) return reason;
+  return Object.assign(new Error("Account selection was aborted."), { name: "AbortError" });
+}
+
+export function checkSignal(signal?: AbortSignal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+/** Stop waiting without cancelling a shared operation needed by other callers. */
+export async function waitForSignal<T>(task: Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+  if (!signal && timeoutMs === undefined) return task;
+  let timer: NodeJS.Timeout | undefined;
+  let aborted: (() => void) | undefined;
+  const stop = new Promise<never>((_, reject) => {
+    if (signal) {
+      aborted = () => reject(abortError(signal));
+      if (signal.aborted) aborted();
+      else signal.addEventListener("abort", aborted, { once: true });
+    }
+    if (timeoutMs !== undefined) timer = setTimeout(() => reject(new AccountWaitTimeout()), timeoutMs);
+  });
+  try {
+    const value = await Promise.race([stop, task]);
+    checkSignal(signal);
+    return value;
+  } finally {
+    clearTimeout(timer);
+    if (aborted) signal?.removeEventListener("abort", aborted);
+  }
+}
+
 interface RuntimeStatus {
   status: AccountSummary["status"];
   statusDetail: string | null;
@@ -38,6 +88,10 @@ interface RuntimeStatus {
   /** The plan agy reported, and when it was last asked. */
   plan: AccountPlan | null;
   planCheckedAt: string | null;
+}
+
+function usageTimedOut(status: RuntimeStatus | undefined) {
+  return status?.status === "error" && /did not answer within|timed? ?out/i.test(status.statusDetail ?? "");
 }
 
 const UNKNOWN: RuntimeStatus = {
@@ -73,6 +127,7 @@ export interface StatusUpdateEvent {
   quota: QuotaGroup[] | null;
   signedInChanged: boolean;
   emailChanged?: boolean;
+  identityChanged?: boolean;
 }
 
 /** Owns the account list, sign-in state, and change notifications. */
@@ -80,12 +135,18 @@ export class AccountService {
   readonly store = new AccountStore();
   readonly signIns = new SignInManager();
   private readonly runtime = new Map<string, RuntimeStatus>();
-  private readonly probing = new Map<string, { epoch: number; task: Promise<void> }>();
+  private readonly probing = new Map<string, { epoch: number; task: Promise<void>; usageReady: Promise<void> }>();
   private readonly epochs = new Map<string, number>();
+  private readonly probeSeq = new Map<string, number>();
+  private readonly appliedProbeSeq = new Map<string, number>();
+  private readonly statusWaiters = new Map<string, Set<() => void>>();
+  private readonly emailWrites = new Map<string, Promise<void>>();
   private readonly authOperations = new Map<string, Promise<unknown>>();
   private readonly listeners = new Set<(revision: number) => void>();
   private readonly statusListeners = new Set<(event: StatusUpdateEvent) => void>();
   private cooldownProvider: (accountId: string) => AccountCooldown[] = () => [];
+  private modelProvider: (accountId: string) => string[] | null = () => null;
+  private defaultResolver: (accounts: readonly AccountSummary[], strategy: FallbackStrategy) => string | null = () => null;
   private runningCountProvider: () => ReadonlyMap<string, number> = () => new Map();
   /** Starts from the clock so it keeps increasing across daemon and plugin restarts. */
   private revision = Date.now();
@@ -159,7 +220,7 @@ export class AccountService {
   }
 
   private saveStatuses(): void {
-    if (!this.statusDirty || this.saveTimer) return;
+    if (this.store.readOnlyReason() || !this.statusDirty || this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.flushStatuses();
     }, 1000);
@@ -170,7 +231,7 @@ export class AccountService {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    if (!this.statusDirty) return;
+    if (this.store.readOnlyReason() || !this.statusDirty) return;
     this.statusDirty = false;
     const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
     const file = statusFile();
@@ -190,6 +251,14 @@ export class AccountService {
 
   setCooldownProvider(provider: (accountId: string) => AccountCooldown[]): void {
     this.cooldownProvider = provider;
+  }
+
+  setModelProvider(provider: (accountId: string) => string[] | null): void {
+    this.modelProvider = provider;
+  }
+
+  setDefaultResolver(resolver: (accounts: readonly AccountSummary[], strategy: FallbackStrategy) => string | null): void {
+    this.defaultResolver = resolver;
   }
 
   setRunningCountProvider(provider: () => ReadonlyMap<string, number>): void {
@@ -290,9 +359,15 @@ export class AccountService {
     return this.store.get(accountId)?.label ?? accountId;
   }
 
+  assertAccountOpenable(accountId: string): void {
+    if (accountId !== SYSTEM_ACCOUNT_ID) this.store.assertWritable();
+  }
+
   /** Ensures a profile account's HOME and settings.json (with any per-account Orchestrator override). */
   async ensureAccountProfile(accountId: string): Promise<string | null> {
     if (accountId === SYSTEM_ACCOUNT_ID) return null;
+    await this.store.load();
+    this.assertAccountOpenable(accountId);
     const account = this.store.get(accountId);
     if (!account) return null;
     return ensureProfile(accountId, account.orchestrator);
@@ -300,6 +375,8 @@ export class AccountService {
 
   /** Re-syncs settings.json into every existing profile (e.g. after global Orchestrator settings change). */
   async syncAllProfiles(): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     const accounts = this.store.readonlyData().accounts;
     await Promise.all(
       accounts.map((account) =>
@@ -311,27 +388,52 @@ export class AccountService {
   }
 
   /** Re-checks sign-in and quota for one account. Concurrent calls of the same epoch share one probe. */
-  refreshOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
+  refreshOne(accountId: string, options?: { forcePlan?: boolean; skipPlan?: boolean; timeoutMs?: number }): Promise<void> {
     const auth = this.authOperations.get(accountId);
     return auth
       ? auth.catch(() => undefined).then(() => this.refreshOne(accountId, options))
       : this.probeOne(accountId, options);
   }
 
-  private probeOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
+  private probeOne(
+    accountId: string,
+    options?: { forcePlan?: boolean; skipPlan?: boolean; timeoutMs?: number },
+  ): Promise<void> {
     const epoch = this.epochOf(accountId);
     const running = this.probing.get(accountId);
-    if (running && running.epoch === epoch) {
-      return options?.forcePlan ? running.task.then(() => this.refreshOne(accountId, options)) : running.task;
+    if (running && running.epoch === epoch && !options?.forcePlan) {
+      return running.task;
     }
+    const seq = (this.probeSeq.get(accountId) ?? 0) + 1;
+    this.probeSeq.set(accountId, seq);
+    const current = () =>
+      this.exists(accountId) &&
+      this.epochOf(accountId) === epoch &&
+      this.probeSeq.get(accountId) === seq &&
+      seq >= (this.appliedProbeSeq.get(accountId) ?? 0);
+    const apply = (status: RuntimeStatus) => {
+      this.appliedProbeSeq.set(accountId, seq);
+      this.setRuntime(accountId, status);
+      if (status.status === "signed-in" || status.status === "signed-out") {
+        for (const wake of this.statusWaiters.get(accountId) ?? []) wake();
+      }
+      mutated = true;
+    };
+    let finishUsage!: () => void;
+    const usageReady = new Promise<void>((resolve) => {
+      finishUsage = resolve;
+    });
+    let mutated = false;
     const task = (async () => {
+      await this.store.load();
+      if (this.store.readOnlyReason()) return;
       if (!this.exists(accountId)) return;
       const agy = await this.agy();
       const checkedAt = new Date().toISOString();
       const previous = this.runtime.get(accountId) ?? UNKNOWN;
       if (!agy) {
-        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
-        this.setRuntime(accountId, {
+        if (!current()) return;
+        apply({
           ...previous,
           status: "error",
           statusDetail: "agy was not found on this host",
@@ -341,22 +443,35 @@ export class AccountService {
         return;
       }
       if (accountId !== SYSTEM_ACCOUNT_ID) {
-        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+        if (!current()) return;
         await this.ensureAccountProfile(accountId);
       }
       const result =
         accountId !== SYSTEM_ACCOUNT_ID && !(await this.hasSignInFile(accountId))
           ? ({ kind: "signed-out", detail: "No independent sign-in was found for this account." } as const)
-          : await probeAccount(agy, accountId);
-      if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+          : await probeAccount(agy, accountId, options?.timeoutMs);
+      if (!current()) return;
+      const nextStatus: RuntimeStatus = {
+        ...previous,
+        status: result.kind,
+        statusDetail: result.kind === "signed-in" ? null : result.detail,
+        checkedAt: new Date().toISOString(),
+        quota: result.kind === "signed-in" ? result.quota : null,
+      };
+      apply(nextStatus);
+      finishUsage();
       const email = result.kind === "signed-in" ? await readAccountEmail(accountId) : null;
+      // A prior probe may already be inside the store's atomic rename.
+      // Compare with the committed email before deciding this probe has nothing to update.
+      await this.emailWrites.get(accountId)?.catch(() => undefined);
+      if (!current()) return;
       const knownEmail =
         accountId === SYSTEM_ACCOUNT_ID ? this.store.readonlyData().systemEmail : (this.store.get(accountId)?.email ?? null);
       let { plan, planCheckedAt } = previous;
       if (result.kind === "signed-out") {
         plan = null;
         planCheckedAt = null;
-      } else if (result.kind === "signed-in") {
+      } else if (result.kind === "signed-in" && !options?.skipPlan) {
         // Another Google account signed in here: the old plan no longer applies.
         const otherAccount = email !== null && knownEmail !== null && email !== knownEmail;
         const age = planCheckedAt ? Date.now() - Date.parse(planCheckedAt) : Infinity;
@@ -366,7 +481,7 @@ export class AccountService {
           age > (plan ? PLAN_MAX_AGE_MS : PLAN_RETRY_MS);
         if (shouldCheckPlan) {
           const read = await readPlan(agy, accountId).catch(() => null);
-          if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+          if (!current()) return;
           if (read) {
             plan = read;
             planCheckedAt = new Date().toISOString();
@@ -377,41 +492,43 @@ export class AccountService {
           }
         }
       }
-      if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
-      const nextStatus: RuntimeStatus = {
-        status: result.kind,
-        statusDetail: result.kind === "signed-in" ? null : result.detail,
-        checkedAt,
-        quota: result.kind === "signed-in" ? result.quota : null,
-        plan,
-        planCheckedAt,
-      };
-      this.setRuntime(accountId, nextStatus);
-      if (result.kind === "signed-in" && email && email !== knownEmail) {
-        await this.store.update((data) => {
+      if (!current()) return;
+      if (this.runtime.get(accountId) !== nextStatus) return;
+      apply({ ...nextStatus, plan, planCheckedAt });
+      if (
+        (result.kind === "signed-in" && email && email !== knownEmail) ||
+        (result.kind === "signed-out" && accountId !== SYSTEM_ACCOUNT_ID && knownEmail !== null)
+      ) {
+        const write = this.store.update((data) => {
+          if (!current()) return;
           if (accountId === SYSTEM_ACCOUNT_ID) data.systemEmail = email;
           else {
             const account = data.accounts.find((entry) => entry.id === accountId);
             if (account) account.email = email;
           }
         });
-      } else if (result.kind === "signed-out" && accountId !== SYSTEM_ACCOUNT_ID && knownEmail !== null) {
-        await this.store.update((data) => {
-          const account = data.accounts.find((entry) => entry.id === accountId);
-          if (account) account.email = null;
-        });
+        this.emailWrites.set(accountId, write);
+        try {
+          await write;
+        } finally {
+          if (this.emailWrites.get(accountId) === write) this.emailWrites.delete(accountId);
+        }
       }
+      if (!current()) return;
+      const emailChanged = result.kind === "signed-in" && email !== null && email !== knownEmail;
+      const identityChanged = email !== null && knownEmail !== null && email !== knownEmail;
       this.emitStatus({
         accountId,
         status: result.kind,
         quota: nextStatus.quota,
         signedInChanged: previous.status !== result.kind,
-        emailChanged: result.kind === "signed-in" && email !== null && email !== knownEmail,
+        emailChanged,
+        identityChanged,
       });
     })()
       .catch((error: unknown) => {
-        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
-        this.setRuntime(accountId, {
+        if (!current()) return;
+        apply({
           ...(this.runtime.get(accountId) ?? UNKNOWN),
           status: "error",
           statusDetail: error instanceof Error ? error.message : String(error),
@@ -420,10 +537,11 @@ export class AccountService {
         });
       })
       .finally(() => {
+        finishUsage();
         if (this.probing.get(accountId)?.task === task) this.probing.delete(accountId);
-        if (this.exists(accountId)) this.changed();
+        if (mutated && current() && !this.store.readOnlyReason()) this.changed();
       });
-    this.probing.set(accountId, { epoch, task });
+    this.probing.set(accountId, { epoch, task, usageReady });
     return task;
   }
 
@@ -446,30 +564,85 @@ export class AccountService {
     return this.runtime.get(accountId)?.status ?? "unknown";
   }
 
-  /** Last known quota; returns cached status immediately (refreshing in background if stale) and only blocks when nothing is known yet. */
-  async quotaFor(accountId: string, maxAgeMs: number): Promise<RuntimeStatus> {
+  /** Last known quota, probing first when nothing is known yet or stale. */
+  async quotaFor(
+    accountId: string,
+    maxAgeMs: number,
+    options?: QuotaProbeOptions,
+  ): Promise<RuntimeStatus & { timedOut?: boolean }> {
+    checkSignal(options?.signal);
     const current = this.runtime.get(accountId);
     const age = current?.checkedAt ? Date.now() - Date.parse(current.checkedAt) : Infinity;
-    const hasKnown = Boolean(current && (current.status === "signed-in" || current.status === "signed-out"));
-    if (!hasKnown) {
-      await this.refreshOne(accountId);
-      return this.runtime.get(accountId) ?? UNKNOWN;
+    if (this.probing.has(accountId) || !current || age > maxAgeMs || usageTimedOut(current)) {
+      const { skipPlan, timeoutMs, signal } = options ?? {};
+      const startedAt = Date.now();
+      const startAppliedSeq = this.appliedProbeSeq.get(accountId) ?? 0;
+      const freshAuth = () => {
+        const latest = this.runtime.get(accountId);
+        return latest &&
+          (latest.status === "signed-in" || latest.status === "signed-out") &&
+          ((this.appliedProbeSeq.get(accountId) ?? 0) > startAppliedSeq ||
+            (latest !== current && Date.parse(latest.checkedAt ?? "") >= startedAt))
+          ? latest
+          : undefined;
+      };
+      let wake!: () => void;
+      const updated = new Promise<void>((resolve) => {
+        wake = () => {
+          if (freshAuth()) resolve();
+        };
+      });
+      const waiters = this.statusWaiters.get(accountId) ?? new Set();
+      this.statusWaiters.set(accountId, waiters);
+      waiters.add(wake);
+      try {
+        const task = this.refreshOne(accountId, { skipPlan, timeoutMs });
+        let probe = this.probing.get(accountId);
+        const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+        do {
+          const ready = (skipPlan ? probe?.usageReady : probe?.task) ?? task;
+          await waitForSignal(
+            Promise.race([ready, updated]),
+            signal,
+            deadline === undefined ? undefined : deadline - Date.now(),
+          );
+          if (freshAuth()) break;
+          const latest = this.probing.get(accountId);
+          if (latest === probe) break;
+          probe = latest;
+        } while (probe);
+      } catch (error) {
+        checkSignal(signal);
+        if (!(error instanceof AccountWaitTimeout)) throw error;
+        const latest = freshAuth();
+        if (latest) return latest;
+        return { ...(this.runtime.get(accountId) ?? UNKNOWN), timedOut: true };
+      } finally {
+        waiters.delete(wake);
+        if (!waiters.size) this.statusWaiters.delete(accountId);
+      }
     }
-    if (age > maxAgeMs) {
-      void this.refreshOne(accountId).catch(() => undefined);
-    }
-    return current!;
+    checkSignal(options?.signal);
+    const result = this.runtime.get(accountId) ?? UNKNOWN;
+    return usageTimedOut(result) ? { ...result, timedOut: true } : result;
   }
 
   async state(): Promise<AccountsState> {
+    await this.init();
     const agy = await this.agy();
     const data = this.store.readonlyData();
     const problems: string[] = [];
+    const readOnly = this.store.readOnlyReason();
+    if (readOnly) problems.push(readOnly);
     if (!agy) problems.push("agy was not found on this host. Install the Antigravity CLI, then refresh.");
+    const normalizedDefault = isAutoAccountId(data.defaultAccountId) ? AUTO_ACCOUNT_ID : data.defaultAccountId;
     const defaultExists =
-      data.defaultAccountId === SYSTEM_ACCOUNT_ID ||
-      data.accounts.some((account) => account.id === data.defaultAccountId);
-    const defaultAccountId = defaultExists ? data.defaultAccountId : SYSTEM_ACCOUNT_ID;
+      normalizedDefault === AUTO_ACCOUNT_ID ||
+      normalizedDefault === SYSTEM_ACCOUNT_ID ||
+      data.accounts.some((account) => account.id === normalizedDefault);
+    const defaultAccountId: DefaultAccountId = defaultExists
+      ? (normalizedDefault as DefaultAccountId)
+      : SYSTEM_ACCOUNT_ID;
     const byId = new Map<string, AccountSummary>();
 
     const system = this.runtime.get(SYSTEM_ACCOUNT_ID) ?? UNKNOWN;
@@ -492,6 +665,8 @@ export class AccountService {
       routingShare: null,
       cooldowns: this.cooldownProvider(SYSTEM_ACCOUNT_ID),
       orchestratorOverride: null,
+      note: data.systemNote,
+      supportedModels: this.modelProvider(SYSTEM_ACCOUNT_ID),
     });
 
     for (const account of data.accounts) {
@@ -515,6 +690,8 @@ export class AccountService {
         routingShare: null,
         cooldowns: this.cooldownProvider(account.id),
         orchestratorOverride: account.orchestrator,
+        note: account.note,
+        supportedModels: this.modelProvider(account.id),
       });
     }
 
@@ -522,22 +699,36 @@ export class AccountService {
       .map((id) => byId.get(id))
       .filter((entry): entry is AccountSummary => Boolean(entry));
 
-    if (data.routing.mode !== "default") {
+    const effectiveShareMode =
+      data.routing.mode !== "default"
+        ? data.routing.mode
+        : defaultAccountId === AUTO_ACCOUNT_ID
+          ? "balanced"
+          : "default";
+    if (effectiveShareMode !== "default") {
       const shares = computeRoutingShares(
         accounts,
-        data.routing.mode,
+        effectiveShareMode,
         data.routing.reservePercent,
         "gemini",
         this.runningCountProvider(),
+        Date.now(),
+        data.fallback.preemptiveThreshold,
       );
       for (const account of accounts) {
         account.routingShare = shares.get(account.id) ?? null;
       }
     }
 
+    const resolvedDefaultAccountId =
+      defaultAccountId === AUTO_ACCOUNT_ID
+        ? this.defaultResolver(accounts, data.fallback.strategy)
+        : defaultAccountId;
+
     return {
       accounts,
       defaultAccountId,
+      resolvedDefaultAccountId,
       agyPath: agy,
       agyVersion: this.agyVersionValue,
       problems,
@@ -552,6 +743,8 @@ export class AccountService {
   }
 
   async setFallback(patch: Partial<FallbackSettings>): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     await this.store.update((data) => {
       data.fallback = { ...data.fallback, ...patch };
     });
@@ -563,6 +756,8 @@ export class AccountService {
   }
 
   async setRouting(patch: Partial<RoutingSettings>): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     await this.store.update((data) => {
       data.routing = { ...data.routing, ...patch };
     });
@@ -580,6 +775,8 @@ export class AccountService {
   }
 
   async create(label: string): Promise<AccountSummary> {
+    await this.store.load();
+    this.store.assertWritable();
     const id = this.store.newAccountId();
     await this.store.update((data) => {
       data.accounts.push({
@@ -592,6 +789,7 @@ export class AccountService {
         fallbackEnabled: true,
         weight: null,
         orchestrator: null,
+        note: null,
       });
       const order = orderedAccountIds(data);
       if (!order.includes(id)) order.push(id);
@@ -606,6 +804,8 @@ export class AccountService {
   }
 
   async rename(accountId: string, label: string): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     this.requireAccount(accountId);
     await this.store.update((data) => {
       if (accountId === SYSTEM_ACCOUNT_ID) data.systemLabel = label;
@@ -618,6 +818,8 @@ export class AccountService {
   }
 
   async move(accountId: string, direction: "up" | "down"): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     this.requireAccount(accountId);
     await this.store.update((data) => {
       const order = orderedAccountIds(data);
@@ -635,22 +837,33 @@ export class AccountService {
 
   async setAccountOptions(
     accountId: string,
-    patch: { fallbackEnabled?: boolean; weight?: number | null; orchestratorOverride?: OrchestratorChoice | null },
+    patch: {
+      fallbackEnabled?: boolean;
+      weight?: number | null;
+      note?: string | null;
+      orchestratorOverride?: OrchestratorChoice | null;
+    },
   ): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     this.requireAccount(accountId);
     if (accountId === SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {
       throw new Error("The system account uses the global Orchestrator setting.");
     }
+    const normalizedNote =
+      patch.note === undefined ? undefined : patch.note && patch.note.trim().length > 0 ? patch.note.trim() : null;
     await this.store.update((data) => {
       if (accountId === SYSTEM_ACCOUNT_ID) {
         if (patch.fallbackEnabled !== undefined) data.systemFallbackEnabled = patch.fallbackEnabled;
         if (patch.weight !== undefined) data.systemWeight = patch.weight;
+        if (normalizedNote !== undefined) data.systemNote = normalizedNote;
         return;
       }
       const entry = data.accounts.find((candidate) => candidate.id === accountId);
       if (!entry) return;
       if (patch.fallbackEnabled !== undefined) entry.fallbackEnabled = patch.fallbackEnabled;
       if (patch.weight !== undefined) entry.weight = patch.weight;
+      if (normalizedNote !== undefined) entry.note = normalizedNote;
       if (patch.orchestratorOverride !== undefined) entry.orchestrator = patch.orchestratorOverride;
     });
     if (accountId !== SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {
@@ -659,9 +872,13 @@ export class AccountService {
     this.changed();
   }
 
-  async setDefault(accountId: string): Promise<void> {
-    const account = this.requireAccount(accountId);
-    if (account?.unsafeDetail) throw new Error(account.unsafeDetail);
+  async setDefault(accountId: DefaultAccountId): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
+    if (accountId !== AUTO_ACCOUNT_ID) {
+      const account = this.requireAccount(accountId);
+      if (account?.unsafeDetail) throw new Error(account.unsafeDetail);
+    }
     await this.store.update((data) => {
       data.defaultAccountId = accountId;
     });
@@ -679,6 +896,8 @@ export class AccountService {
 
   /** Recovers files agents saved in a profile HOME into ~/Antigravity Console without deleting the account. */
   async recoverSavedFiles(accountId: string): Promise<SavedFiles | null> {
+    await this.store.load();
+    this.store.assertWritable();
     const account = this.requireProfileAccount(accountId);
     const preserved = await recoverSavedFiles(accountId, account.label);
     return preserved
@@ -693,8 +912,11 @@ export class AccountService {
   /** Removes a profile account. Returns where its saved files went, or null when it had none. */
   remove(accountId: string): Promise<SavedFiles | null> {
     return this.changeProfileAuth(accountId, async () => {
+      await this.store.load();
+      this.store.assertWritable();
       const account = this.requireProfileAccount(accountId);
       this.bumpEpoch(accountId);
+      this.probing.delete(accountId);
       this.signIns.cancelForAccount(accountId);
       const preserved = await removeProfile(accountId, account.label);
       await this.store.update((data) => {
@@ -710,8 +932,11 @@ export class AccountService {
 
   signOut(accountId: string): Promise<void> {
     return this.changeProfileAuth(accountId, async () => {
+      await this.store.load();
+      this.store.assertWritable();
       const account = this.requireProfileAccount(accountId);
       this.bumpEpoch(accountId);
+      this.probing.delete(accountId);
       this.signIns.cancelForAccount(accountId);
       await deleteSignIn(accountId, account.credentialFiles);
       await this.store.update((data) => {
@@ -730,6 +955,8 @@ export class AccountService {
 
   startSignIn(accountId: string): Promise<{ loginId: string; url: string; expiresAt: string }> {
     return this.changeProfileAuth(accountId, async () => {
+      await this.store.load();
+      this.store.assertWritable();
       this.requireProfileAccount(accountId);
       const agy = await this.requireAgy();
       await this.ensureAccountProfile(accountId);
@@ -739,6 +966,8 @@ export class AccountService {
 
   /** Completes a sign-in only after agy has written a new independent credential. */
   async submitSignIn(loginId: string, code: string): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
     const accountId = this.signIns.accountOf(loginId);
     if (!accountId) throw new Error("This sign-in expired or was cancelled. Start again.");
     return this.changeProfileAuth(accountId, async () => {
@@ -749,6 +978,7 @@ export class AccountService {
       const tokenAfter = await profileSignInFingerprint(accountId);
       const scan = await scanAfterSignIn(accountId, outcome.submittedAt);
       this.bumpEpoch(accountId);
+      this.probing.delete(accountId);
 
       let unsafeDetail: string | null = null;
       if (scan.leaked.length > 0) {
@@ -791,6 +1021,7 @@ export class AccountService {
   }
 
   cancelSignIn(loginId: string): void {
+    this.store.assertWritable();
     this.signIns.cancel(loginId);
   }
 

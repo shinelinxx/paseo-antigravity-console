@@ -163,11 +163,11 @@ function firstMeaningfulLine(text: string): string {
 }
 
 /** Reads an account's quota with `agy -p /usage`, which also tells whether it is signed in. */
-export async function probeAccount(agyPath: string, accountId: string): Promise<ProbeResult> {
+export async function probeAccount(agyPath: string, accountId: string, timeoutMs = 25_000): Promise<ProbeResult> {
   const result = await runAgy(agyPath, ["-p", "/usage", "--output-format", "json"], {
     env: commandEnv(accountId),
     cwd: accountId === SYSTEM_ACCOUNT_ID ? os.tmpdir() : profileHome(accountId),
-    timeoutMs: 25_000,
+    timeoutMs,
     stopWhen: NEEDS_SIGN_IN,
   });
   if (result.stopped) return { kind: "signed-out", detail: "Not signed in" };
@@ -204,7 +204,7 @@ export async function probeAccount(agyPath: string, accountId: string): Promise<
   if (SIGN_IN_TEXT.test(combined)) {
     return { kind: "signed-out", detail: "Not signed in" };
   }
-  if (result.timedOut) return { kind: "error", detail: "agy did not answer within 25 seconds" };
+  if (result.timedOut) return { kind: "error", detail: `agy did not answer within ${Math.ceil(timeoutMs / 1000)} seconds` };
   return {
     kind: "error",
     detail: firstMeaningfulLine(combined) || `agy exited with code ${String(result.code)}`,

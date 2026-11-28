@@ -1,8 +1,9 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import {
+  AUTO_ACCOUNT_ID,
   clearCooldownRpc,
   createAccountRpc,
   moveAccountRpc,
@@ -15,13 +16,14 @@ import {
   setRoutingRpc,
   signOutAccountRpc,
   type AccountSummary,
+  type DefaultAccountId,
   type FallbackStrategy,
   type OrchestratorState,
   type RoutingMode,
 } from "../shared/contracts";
 import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
-import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog, WeightDialog } from "./dialogs";
+import { AccountAgentsDialog, ConfirmRemove, NameDialog, NoteDialog, RecoverFilesDialog, WeightDialog } from "./dialogs";
 import { displayLabel } from "./labels";
 import { antigravityLogoSvg } from "./logo";
 import { errorMessage, messages } from "./messages";
@@ -37,6 +39,7 @@ const EMPTY_ACCOUNTS: readonly AccountSummary[] = [];
 type Dialog =
   | { kind: "add" }
   | { kind: "rename"; account: AccountSummary }
+  | { kind: "editNote"; account: AccountSummary }
   | { kind: "remove"; account: AccountSummary }
   | { kind: "signIn"; account: AccountSummary }
   | { kind: "recoverFiles"; account: AccountSummary }
@@ -267,6 +270,8 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
         });
       case "rename":
         return openDialog({ kind: "rename", account }, wasModalMenuOpen);
+      case "editNote":
+        return openDialog({ kind: "editNote", account }, wasModalMenuOpen);
       case "remove":
         return openDialog({ kind: "remove", account }, wasModalMenuOpen);
       case "signIn":
@@ -289,9 +294,23 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const columns = contentWidth >= 820 ? 2 : 1;
   const cardWidth = columns === 2 ? (contentWidth - gap) / 2 : contentWidth;
   const profiles = data?.accounts.filter((account) => account.kind === "profile") ?? [];
-  const fallback = data?.accounts.find((account) => account.id === data.defaultAccountId);
+  const fallback =
+    data && data.defaultAccountId !== AUTO_ACCOUNT_ID
+      ? data.accounts.find((account) => account.id === data.defaultAccountId)
+      : undefined;
+  const resolvedAutoAccount =
+    data && data.defaultAccountId === AUTO_ACCOUNT_ID && data.resolvedDefaultAccountId
+      ? data.accounts.find((account) => account.id === data.resolvedDefaultAccountId)
+      : undefined;
   const defaultUnavailable =
     fallback && fallback.kind === "profile" && (!fallback.usable || fallback.status === "signed-out");
+  const openAgent = useMemo(
+    () =>
+      navigation?.openAgent
+        ? (agentId: string) => navigation.openAgent({ agentId, serverId: host.id })
+        : undefined,
+    [navigation, host.id],
+  );
   // An odd number of cards leaves room for the add tile beside the last one.
   const showAddTile = data !== undefined && (profiles.length === 0 || (columns === 2 && data.accounts.length % 2 === 1));
 
@@ -374,7 +393,13 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           ) : null}
 
           {contentWidth > 0 ? (
-            <UsageSection colors={colors} width={contentWidth} compact={compact} accounts={data?.accounts ?? EMPTY_ACCOUNTS} />
+            <UsageSection
+              colors={colors}
+              width={contentWidth}
+              compact={compact}
+              accounts={data?.accounts ?? EMPTY_ACCOUNTS}
+              onOpenAgent={openAgent}
+            />
           ) : null}
 
           {!data && !error ? (
@@ -439,12 +464,24 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                 />
                 <SettingsSelect
                   label={t("overview.default")}
+                  hint={
+                    data.defaultAccountId === AUTO_ACCOUNT_ID
+                      ? resolvedAutoAccount
+                        ? t("auto.resolvedHint", {
+                            label: displayLabel(resolvedAutoAccount.label, t, resolvedAutoAccount.kind),
+                          })
+                        : t("auto.noEligible")
+                      : undefined
+                  }
                   value={data.defaultAccountId}
-                  options={data.accounts
-                    .filter((account) => account.usable || account.id === data.defaultAccountId)
-                    .map((account) => ({ value: account.id, label: displayLabel(account.label, t, account.kind) }))}
+                  options={[
+                    { value: AUTO_ACCOUNT_ID, label: t("auto.option") },
+                    ...data.accounts
+                      .filter((account) => account.usable || account.id === data.defaultAccountId)
+                      .map((account) => ({ value: account.id, label: displayLabel(account.label, t, account.kind) })),
+                  ]}
                   onValueChange={(accountId) => {
-                    void setDefault({ accountId })
+                    void setDefault({ accountId: accountId as DefaultAccountId })
                       .then(accept)
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
@@ -474,7 +511,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                 />
                 <SettingsSelect
                   label={t("settings.strategy")}
-                  disabled={!data.fallback.enabled}
+                  disabled={!data.fallback.enabled && data.defaultAccountId !== AUTO_ACCOUNT_ID}
                   value={data.fallback.strategy}
                   options={[
                     { value: "order", label: t("settings.strategyOrder") },
@@ -484,6 +521,24 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   ]}
                   onValueChange={(value) => {
                     void setFallback({ strategy: value as FallbackStrategy })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
+                <SettingsSelect
+                  label={t("settings.preemptive")}
+                  hint={t("settings.preemptiveHint")}
+                  disabled={!data.fallback.enabled}
+                  value={String(data.fallback.preemptiveThreshold)}
+                  options={[
+                    { value: "0", label: t("settings.preemptiveOff") },
+                    { value: "0.05", label: t("settings.preemptivePct", { pct: 5 }) },
+                    { value: "0.1", label: t("settings.preemptivePct", { pct: 10 }) },
+                    { value: "0.15", label: t("settings.preemptivePct", { pct: 15 }) },
+                    { value: "0.2", label: t("settings.preemptivePct", { pct: 20 }) },
+                  ]}
+                  onValueChange={(value) => {
+                    void setFallback({ preemptiveThreshold: Number(value) })
                       .then(accept)
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
@@ -548,6 +603,18 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           }}
         />
       ) : null}
+      {dialog?.kind === "editNote" ? (
+        <NoteDialog
+          colors={colors}
+          accountLabel={displayLabel(dialog.account.label, t, dialog.account.kind)}
+          initial={dialog.account.note ?? ""}
+          onClose={() => setDialog(null)}
+          onSubmit={async (note) => {
+            accept(await setOptions({ accountId: dialog.account.id, note }));
+            setDialog(null);
+          }}
+        />
+      ) : null}
       {dialog?.kind === "remove" ? (
         <ConfirmRemove
           colors={colors}
@@ -579,11 +646,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           account={dialog.account}
           accounts={data.accounts}
           agents={members.filter((member) => member.account === dialog.account.id)}
-          onOpenAgent={
-            navigation?.openAgent
-              ? (agentId) => navigation.openAgent({ agentId, serverId: host.id })
-              : undefined
-          }
+          onOpenAgent={openAgent}
           onClose={() => setDialog(null)}
         />
       ) : null}

@@ -15,7 +15,9 @@ export function FallbackNote({ item, theme }: PluginTimelineItemProps<FallbackEv
   const reason = t(`fallback.reason.${event.reason}`);
   const text =
     event.event === "switch"
-      ? t("fallback.switch", { from, to: displayLabel(event.to ?? "", t), reason })
+      ? event.reason === "low-quota"
+        ? t("fallback.preemptive", { from, to: displayLabel(event.to ?? "", t) })
+        : t("fallback.switch", { from, to: displayLabel(event.to ?? "", t), reason })
       : event.event === "retry"
         ? t("fallback.retry", { from, attempt: event.attempt, retries: event.retries })
         : t("fallback.exhausted");

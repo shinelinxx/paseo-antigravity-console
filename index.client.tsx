@@ -9,6 +9,7 @@ import { WorkspaceRowBadge } from "@getpaseo/plugin/client/ui";
 import { useSyncExternalStore } from "react";
 import { AccountsScreen } from "./client/AccountsScreen";
 import { observeAgents } from "./client/agents";
+import { ARTIFACTS_PANEL_ID, artifactsAttachmentSource, createArtifactsView } from "./client/artifacts";
 import { ComposerAccount } from "./client/composer";
 import { antigravityLogoSvg } from "./client/logo";
 import { errorMessage, messages } from "./client/messages";
@@ -16,18 +17,23 @@ import { QuotaSidebarItem } from "./client/sidebar";
 import { SUBAGENT_PANEL_ID, createSubagentViews } from "./client/subagents";
 import { AskQuestionRow } from "./client/questions";
 import { FallbackNote } from "./client/timeline";
+import { CompactToolRow, LegacyUpdateStepsRow, UpdateStepsRow } from "./client/tools";
 import { registerSubagentTransforms } from "./client/transform";
 import { AccountsClientContext } from "./client/useAccounts";
 import {
   ASK_QUESTION_TIMELINE_KIND,
+  COMPACT_TOOL_TIMELINE_KIND,
   FALLBACK_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
+  UPDATE_STEPS_TIMELINE_KIND,
   askQuestionCardSchema,
+  compactToolCardSchema,
   fallbackEventSchema,
   refreshAccountsRpc,
   subagentCardSchema,
   subagentCheckSchema,
+  updateStepsCardSchema,
 } from "./shared/contracts";
 
 const settingsLogo = { svg: antigravityLogoSvg("settings") };
@@ -35,6 +41,7 @@ const commandLogo = { svg: antigravityLogoSvg("command") };
 
 export default function contribute(client: PluginClientContext) {
   const subagents = createSubagentViews(client);
+  const artifacts = createArtifactsView(client);
   const observation = observeAgents(client, subagents.open);
   const title = messages.message("title");
 
@@ -101,17 +108,34 @@ export default function contribute(client: PluginClientContext) {
         }
       },
     }),
+    client.addCommandCenterItem({
+      id: "open-artifacts",
+      title: messages.message("artifacts.commandOpen"),
+      icon: "FileStack",
+      context: "agent",
+      onSelect: ({ openPanel }) => openPanel(ARTIFACTS_PANEL_ID),
+    }),
     client.addComposerItem({ id: "account", Component: Composer }),
+    client.addAttachmentSource(artifactsAttachmentSource),
     client.addTimelineRenderer({ kind: FALLBACK_TIMELINE_KIND, version: 1, schema: fallbackEventSchema, Component: FallbackNote }),
     client.addTimelineRenderer({ kind: SUBAGENT_TIMELINE_KIND, version: 1, schema: subagentCardSchema, Component: subagents.SubagentCardRow }),
     client.addTimelineRenderer({ kind: SUBAGENT_LIST_TIMELINE_KIND, version: 1, schema: subagentCheckSchema, Component: subagents.SubagentCheckRow }),
     client.addTimelineRenderer({ kind: ASK_QUESTION_TIMELINE_KIND, version: 1, schema: askQuestionCardSchema, Component: AskQuestionRow }),
-    registerSubagentTransforms(client),
+    client.addTimelineRenderer({ kind: UPDATE_STEPS_TIMELINE_KIND, version: 1, schema: updateStepsCardSchema, Component: LegacyUpdateStepsRow }),
+    client.addTimelineRenderer({ kind: UPDATE_STEPS_TIMELINE_KIND, version: 2, schema: updateStepsCardSchema, Component: UpdateStepsRow }),
+    client.addTimelineRenderer({ kind: COMPACT_TOOL_TIMELINE_KIND, version: 1, schema: compactToolCardSchema, Component: CompactToolRow }),
+    registerSubagentTransforms(client, { onStepsToolSeen: observation.syncTasksSoon }),
     client.addAgentPanel({
       id: SUBAGENT_PANEL_ID,
       title: messages.message("subagents.title"),
       icon: "Bot",
       Component: subagents.SubagentsPanel,
+    }),
+    client.addAgentPanel({
+      id: ARTIFACTS_PANEL_ID,
+      title: messages.message("artifacts.title"),
+      icon: "FileStack",
+      Component: artifacts.ArtifactsPanel,
     }),
   ];
   return () => {

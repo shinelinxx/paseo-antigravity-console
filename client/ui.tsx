@@ -200,20 +200,18 @@ export function Avatar({
         style={{
           width: size,
           height: size,
-          borderRadius: size * 0.3,
+          borderRadius: Math.round(size * 0.22),
           alignItems: "center",
           justifyContent: "center",
-          backgroundColor: colors.surface0,
-          borderWidth: 1,
-          borderColor: colors.border,
+          overflow: "hidden",
         }}
       >
-        <Icon icon={{ svg: logo }} size={Math.round(size * 0.6)} color={colors.foreground} />
+        <Icon icon={{ svg: logo }} size={size} color={colors.foreground} />
       </View>
     );
   }
-  const ink = hue === undefined ? colors.accent : `hsl(${hue}, 62%, 50%)`;
-  const wash = hue === undefined ? tint(colors.accent, 0.16) : `hsla(${hue}, 62%, 50%, 0.16)`;
+  const ink = hue === undefined || hue < 180 ? colors.accent : colors.foreground;
+  const wash = tint(ink, 0.16);
   return (
     <View
       style={{
@@ -303,7 +301,7 @@ export function Card({
         },
         elevated
           ? {
-              shadowColor: "#000",
+              shadowColor: colors.foreground,
               shadowOpacity: 0.12,
               shadowRadius: 18,
               shadowOffset: { width: 0, height: 8 },

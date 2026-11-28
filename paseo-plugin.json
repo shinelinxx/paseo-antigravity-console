@@ -1,7 +1,7 @@
 {
   "id": "antigravity-accounts",
   "name": "Antigravity Console",
-  "description": "Multiple Google accounts with automatic fallback, quota, usage and cost estimates, subagent views, interactive question cards, and Orchestrator model choices for Paseo's built-in Antigravity provider.",
+  "description": "Multiple Google accounts with weighted session-sticky load balancing, smart auto-routing and fallback, quick quota popover, usage & per-session cost analytics, artifacts & subagent views, interactive question and task cards, and Orchestrator model choices for Paseo's built-in Antigravity provider.",
   "media": [
     "assets/console.png",
     "assets/subagents.png",
@@ -15,7 +15,7 @@
   "translations": {
     "zh-CN": {
       "name": "Antigravity 控制台",
-      "description": "为 Paseo 内置的 Antigravity provider 提供多账号、出错自动切换、额度与用量估价、子代理查看、交互式提问卡片和 Orchestrator 模型设置。"
+      "description": "为 Paseo 内置的 Antigravity provider 提供多账号加权负载均衡与智能自动切换、侧边栏快捷额度浮层、用量与单对话账单、产物与子代理视图、交互式提问与任务卡片以及 Orchestrator 设置。"
     }
   }
 }

@@ -5,30 +5,63 @@ import { z } from "zod";
 export const ANTIGRAVITY_PROVIDER_ID = "antigravity";
 
 /**
- * Agent metadata key that names the account an Antigravity agent runs on.
+ * Agent metadata key that names the account an Antigravity agent currently runs on.
  * Absent (or "default") means the system sign-in that `agy` uses on its own.
  */
 export const ACCOUNT_METADATA_KEY = "antigravity-accounts.account";
 
+/**
+ * Agent metadata key that holds a queued account switch to be consumed on the next session open.
+ * Stores `{ accountId, requestId, source }` (and reads legacy plain string values).
+ * Keeping pending separate from ACCOUNT_METADATA_KEY ensures the effective account never diverges
+ * from the live session if a switch is deferred, races with an open, or is interrupted by a restart.
+ */
+export const PENDING_ACCOUNT_METADATA_KEY = "antigravity-accounts.pendingAccount";
+
+/**
+ * Agent metadata key that records the confirmed live session account for a given configured
+ * `ACCOUNT_METADATA_KEY` (`forAccount`). Writing only this key during open confirmation ensures
+ * a background confirmation can never overwrite a concurrent external write to `ACCOUNT_METADATA_KEY`:
+ * as soon as `ACCOUNT_METADATA_KEY !== forAccount`, the external write takes precedence automatically.
+ */
+export const RUNTIME_ACCOUNT_METADATA_KEY = "antigravity-accounts.runtimeAccount";
+
+/**
+ * Agent metadata key set at `agent.create.before` so the immediate initial `agent.open.before`
+ * (which runs before Paseo registers the agent snapshot) knows the model chosen during creation.
+ */
+export const CREATED_MODEL_METADATA_KEY = "antigravity-accounts.createdModel";
+export const CREATED_AUTO_METADATA_KEY = "antigravity-accounts.createdAuto";
+export const CREATED_REDIRECT_METADATA_KEY = "antigravity-accounts.createdRedirect";
+
+export interface PendingSwitchRecord {
+  accountId: string;
+  requestId: string;
+  source: "user" | "fallback";
+}
+
+export interface RuntimeAccountRecord {
+  accountId: string;
+  forAccount: string;
+  consumedRequestId?: string | null;
+  confirmedAt: number;
+}
+
 /** Id of the system sign-in (the keychain login `agy` uses without this plugin). */
 export const SYSTEM_ACCOUNT_ID = "default";
 
-/** Draft composer metadata sentinel meaning "let load balancing pick an account on creation". */
-export const AUTO_ACCOUNT_ID = "__auto__";
+/** Virtual default choice that lets the plugin pick the best eligible account per new agent. */
+export const AUTO_ACCOUNT_ID = "auto";
 
-/** Synthetic account id used in usage analytics for requests without an observed account turn. */
+/** Legacy draft composer sentinel from v0.2.5 weighted load balancing; treated identically to AUTO_ACCOUNT_ID. */
+export const LEGACY_AUTO_ACCOUNT_ID = "__auto__";
+
+/** Synthetic account id kept for legacy compatibility (unattributed usage is excluded from analytics). */
 export const UNATTRIBUTED_ACCOUNT_ID = "unattributed";
 
-/** True when a provider string (`antigravity` or `antigravity/<model>`) is Antigravity. */
-export function isAntigravityProvider(provider: string | null | undefined): boolean {
-  if (!provider) return false;
-  return provider.split("/")[0] === ANTIGRAVITY_PROVIDER_ID;
-}
-
-/** Reads the account id stored on an agent; returns SYSTEM_ACCOUNT_ID when none is stored. */
-export function accountIdFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined): string {
-  const value = metadata?.[ACCOUNT_METADATA_KEY];
-  return typeof value === "string" && value.length > 0 && value !== AUTO_ACCOUNT_ID ? value : SYSTEM_ACCOUNT_ID;
+/** True when an account id represents automatic routing ("auto" or legacy "__auto__"). */
+export function isAutoAccountId(id: string | null | undefined): boolean {
+  return id === AUTO_ACCOUNT_ID || id === LEGACY_AUTO_ACCOUNT_ID;
 }
 
 /** Infers the default load-balancing weight from an account's Google AI plan (Ultra 20x : Pro 1x). */
@@ -40,8 +73,83 @@ export function inferPlanWeight(plan: string | null | undefined, planId?: string
   return 1;
 }
 
+/** True when a provider string (`antigravity` or `antigravity/<model>`) is Antigravity. */
+export function isAntigravityProvider(provider: string | null | undefined): boolean {
+  if (!provider) return false;
+  return provider.split("/")[0] === ANTIGRAVITY_PROVIDER_ID;
+}
+
+/**
+ * True when an older Paseo host/SDK rejected `filter: { includeBackground: true }` due to missing
+ * background-workspaces / background-agents capability or unsupported filter parameters.
+ * Returns false for cancellations, aborts, or unrelated transport failures.
+ */
+export function isUnsupportedBackgroundFilterError(error: unknown): boolean {
+  const failure = error as { name?: string; code?: unknown; message?: unknown } | null;
+  const message = typeof failure?.message === "string" ? failure.message : String(error ?? "");
+  if (failure?.name === "AbortError" || /\babort(?:ed)?\b|\bcancell?ed\b/i.test(message)) return false;
+  if (failure?.code === -32602 || /^unsupported$/i.test(message)) return true;
+  if (/update the host to use background (?:workspaces|agents)/i.test(message)) return true;
+  return /includeBackground|\bfilter\b|background/i.test(message) &&
+    /unknown|unrecognized|unsupported|not supported|unexpected|invalid|not allowed|not implemented|not available|update the host/i.test(message);
+}
+
+/** Reads the raw configured account id stored in `ACCOUNT_METADATA_KEY`; returns SYSTEM_ACCOUNT_ID when absent. */
+export function configuredAccountIdFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined): string {
+  const value = metadata?.[ACCOUNT_METADATA_KEY];
+  if (typeof value !== "string" || value.length === 0) return SYSTEM_ACCOUNT_ID;
+  return value === LEGACY_AUTO_ACCOUNT_ID ? AUTO_ACCOUNT_ID : value;
+}
+
+/** Reads the confirmed runtime account record stored in `RUNTIME_ACCOUNT_METADATA_KEY`, if valid. */
+export function runtimeAccountFromMetadata(
+  metadata: Readonly<Record<string, unknown>> | null | undefined,
+): RuntimeAccountRecord | null {
+  const value = metadata?.[RUNTIME_ACCOUNT_METADATA_KEY];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.accountId !== "string" || !record.accountId) return null;
+  if (typeof record.forAccount !== "string" || !record.forAccount) return null;
+  const confirmedAt = typeof record.confirmedAt === "number" && Number.isFinite(record.confirmedAt) ? record.confirmedAt : 0;
+  const consumedRequestId = typeof record.consumedRequestId === "string" && record.consumedRequestId ? record.consumedRequestId : null;
+  return { accountId: record.accountId, forAccount: record.forAccount, consumedRequestId, confirmedAt };
+}
+
+/**
+ * Reads the effective account id for an agent from metadata.
+ * Honors a confirmed `RUNTIME_ACCOUNT_METADATA_KEY` only while `ACCOUNT_METADATA_KEY` still matches
+ * `forAccount`, so any external write to `ACCOUNT_METADATA_KEY` takes precedence immediately.
+ */
+export function accountIdFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined): string {
+  const configured = configuredAccountIdFromMetadata(metadata);
+  const runtime = runtimeAccountFromMetadata(metadata);
+  if (runtime && runtime.forAccount === configured) return runtime.accountId;
+  return configured;
+}
+
+/** Reads a queued pending switch record (supporting both structured objects and legacy plain strings). */
+export function pendingSwitchFromMetadata(
+  metadata: Readonly<Record<string, unknown>> | null | undefined,
+): PendingSwitchRecord | null {
+  const value = metadata?.[PENDING_ACCOUNT_METADATA_KEY];
+  if (typeof value === "string" && value.length > 0) {
+    return { accountId: value, requestId: `legacy:${value}`, source: "user" };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.accountId !== "string" || !record.accountId) return null;
+  const requestId = typeof record.requestId === "string" && record.requestId ? record.requestId : `legacy:${record.accountId}`;
+  const source = record.source === "fallback" ? "fallback" : "user";
+  return { accountId: record.accountId, requestId, source };
+}
+
+/** Reads a queued pending account id stored on an agent, or null when none is queued. */
+export function pendingAccountIdFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined): string | null {
+  return pendingSwitchFromMetadata(metadata)?.accountId ?? null;
+}
+
 /** Quota pool a model draws from. */
-export const quotaPoolSchema = z.enum(["gemini", "third-party", "all"]);
+export const quotaPoolSchema = z.enum(["gemini", "third-party", "unknown", "all"]);
 export type QuotaPool = z.infer<typeof quotaPoolSchema>;
 
 /** Infers which agy quota pool a model id or label uses. */
@@ -51,15 +159,40 @@ export function quotaPoolForModel(model: string | null | undefined): "gemini" | 
   return "gemini";
 }
 
+/**
+ * Whether `account` supports `model` based on its cached `agy models` list.
+ * Returns `null` when unknown (no model specified or catalog not yet loaded).
+ */
+export function accountSupportsModel(
+  account: { supportedModels: readonly string[] | null },
+  model: string | null | undefined,
+): boolean | null {
+  if (!model || !account.supportedModels) return null;
+  const normalize = (id: string) => id.trim().toLowerCase().replace(/^antigravity\//, "");
+  const normalized = normalize(model);
+  if (!normalized) return null;
+  const alias = (value: string) => value.replace(/[()]/g, "").replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const modelAlias = alias(normalized);
+  return account.supportedModels.some((id) => {
+    const candidate = normalize(id);
+    return candidate === normalized || (modelAlias !== "" && alias(candidate) === modelAlias);
+  });
+}
+
 export const accountIdSchema = z
   .string()
   .regex(/^(default|a[0-9a-f]{8})$/, "Unknown account id");
+
+export const defaultAccountIdSchema = z.union([accountIdSchema, z.literal(AUTO_ACCOUNT_ID)]);
+export type DefaultAccountId = z.infer<typeof defaultAccountIdSchema>;
 
 export const accountLabelSchema = z
   .string()
   .trim()
   .min(1, "Enter a name")
   .max(40, "Use at most 40 characters");
+
+export const accountNoteSchema = z.string().trim().max(80, "Use at most 80 characters");
 
 export const quotaBucketSchema = z.object({
   id: z.string(),
@@ -89,8 +222,17 @@ export const accountStatusSchema = z.enum([
   "error",
 ]);
 
-export const failureReasonSchema = z.enum(["quota", "auth", "transient", "error"]);
+export const failureReasonSchema = z.enum(["quota", "low-quota", "auth", "transient", "error"]);
 export type FailureReason = z.infer<typeof failureReasonSchema>;
+
+const createdRedirectSchema = z.object({
+  from: accountIdSchema, to: accountIdSchema, reason: failureReasonSchema,
+});
+
+export function createdRedirectFromMetadata(metadata: Readonly<Record<string, unknown>> | null | undefined) {
+  const parsed = createdRedirectSchema.safeParse(metadata?.[CREATED_REDIRECT_METADATA_KEY]);
+  return parsed.success && parsed.data.from === configuredAccountIdFromMetadata(metadata) ? parsed.data : null;
+}
 
 export const accountCooldownSchema = z.object({
   pool: quotaPoolSchema,
@@ -140,6 +282,10 @@ export const accountSummarySchema = z.object({
   cooldowns: z.array(accountCooldownSchema),
   /** Per-account Orchestrator override for profile accounts; null inherits the global choice. */
   orchestratorOverride: orchestratorChoiceSchema.nullable(),
+  /** Optional short user note/tag (for example "Main", "Claude only", or "Backup Ultra"). */
+  note: z.string().nullable(),
+  /** Cached model IDs this account supports (`agy models`), or null when not yet queried. */
+  supportedModels: z.array(z.string()).nullable(),
 });
 
 export type AccountSummary = z.infer<typeof accountSummarySchema>;
@@ -157,6 +303,8 @@ export const fallbackSettingsSchema = z.object({
   retries: z.number().int().min(0).max(3),
   /** order: list order; quota: highest remaining quota; weighted: plan weight * remaining quota; reset: soonest reset. */
   strategy: fallbackStrategySchema,
+  /** Proactive switch threshold (0 disables; e.g. 0.05 switches after a turn when remaining <= 5%). */
+  preemptiveThreshold: z.number().min(0).max(0.5),
 });
 
 export type FallbackSettings = z.infer<typeof fallbackSettingsSchema>;
@@ -176,7 +324,10 @@ export type RoutingSettings = z.infer<typeof routingSettingsSchema>;
 export const accountsStateSchema = z.object({
   /** Accounts in configured fallback priority order. */
   accounts: z.array(accountSummarySchema),
-  defaultAccountId: accountIdSchema,
+  /** Configured default for new agents: a specific account id, or "auto" for smart selection. */
+  defaultAccountId: defaultAccountIdSchema,
+  /** Concrete account id currently preferred, or null when "auto" has no eligible account. */
+  resolvedDefaultAccountId: accountIdSchema.nullable(),
   /** Resolved agy executable, or null when it was not found. */
   agyPath: z.string().nullable(),
   agyVersion: z.string().nullable(),
@@ -220,10 +371,10 @@ export const renameAccountRpc = defineRpc({
   output: accountsStateSchema,
 });
 
-/** Chooses the account new Antigravity agents get. */
+/** Chooses the account new Antigravity agents get (or "auto" for smart selection). */
 export const setDefaultAccountRpc = defineRpc({
   name: "accounts.set-default",
-  input: z.object({ accountId: accountIdSchema }).strict(),
+  input: z.object({ accountId: defaultAccountIdSchema }).strict(),
   output: accountsStateSchema,
 });
 
@@ -239,7 +390,7 @@ export const moveAccountRpc = defineRpc({
   output: accountsStateSchema,
 });
 
-/** Updates per-account options: fallback participation, load-balancing weight, and optional Orchestrator override. */
+/** Updates per-account options: fallback eligibility, load-balancing weight, note/tag, and optional Orchestrator override. */
 export const setAccountOptionsRpc = defineRpc({
   name: "accounts.set-options",
   input: z
@@ -248,6 +399,8 @@ export const setAccountOptionsRpc = defineRpc({
       fallbackEnabled: z.boolean().optional(),
       /** Custom load-balancing weight (0 disables auto-routing; null infers automatically from the plan). */
       weight: accountWeightSchema.nullable().optional(),
+      /** Pass null (or empty string) to clear the account's note/tag. */
+      note: accountNoteSchema.nullable().optional(),
       /** Pass null to inherit the global Orchestrator setting, or `{ planner, executor }` to override. */
       orchestratorOverride: orchestratorChoiceSchema.nullable().optional(),
     })
@@ -358,7 +511,7 @@ export const switchAgentAccountRpc = defineRpc({
     })
     .strict(),
   output: z.object({
-    result: z.enum(["switched", "scheduled", "unchanged"]),
+    result: z.enum(["switched", "scheduled", "unchanged", "busy"]),
     accountLabel: z.string(),
   }),
 });
@@ -389,19 +542,31 @@ export const watchAccountsSubscription = defineSubscription({
   event: z.object({ revision: z.number().int().nonnegative() }),
 });
 
+export const sessionUsageSchema = z.object({
+  requests: z.number().int().nonnegative(),
+  input: z.number().nonnegative(),
+  cached: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cost: z.number().nonnegative(),
+  pricedRequests: z.number().int().nonnegative(),
+});
+export type SessionUsage = z.infer<typeof sessionUsageSchema>;
+
 export const contextUsageSchema = z.object({
   /** Tokens in the context window after the latest model call (new input + cache reads + output). */
   used: z.number().int().nonnegative(),
   /** Context window size; null when neither agy nor the model name tells it. */
   size: z.number().int().positive().nullable(),
-  input: z.number().int().nonnegative(),
-  cached: z.number().int().nonnegative(),
-  output: z.number().int().nonnegative(),
+  input: z.number().nonnegative(),
+  cached: z.number().nonnegative(),
+  output: z.number().nonnegative(),
   /** "agy": the window agy recorded for the call. "model": inferred from the model name. */
   sizeSource: z.enum(["agy", "model"]).nullable(),
   /** ISO time of the latest model call's record. */
   updatedAt: z.string().nullable(),
   model: z.string().nullable(),
+  /** Cumulative token & estimated API cost totals across all calls in this conversation. */
+  session: sessionUsageSchema.nullable(),
 });
 
 export type ContextUsage = z.infer<typeof contextUsageSchema>;
@@ -450,6 +615,22 @@ export const usageAccountBreakdownSchema = usageTotalsSchema.extend({
   conversations: z.number().int().nonnegative(),
 });
 
+export const topConversationSchema = usageTotalsSchema.extend({
+  conversationId: z.string(),
+  title: z.string().nullable(),
+  workspaceName: z.string().nullable(),
+  /** Active (unarchived) Paseo agent id matching this conversation, when available. */
+  agentId: z.string().nullable(),
+  accountId: z.string().nullable(),
+  accountLabel: z.string().nullable(),
+  /** True when requests in this conversation span more than one attributed account. */
+  mixedAccounts: z.boolean().optional(),
+  isSubagent: z.boolean(),
+  primaryModel: z.string().nullable(),
+  lastAt: z.string(),
+});
+export type TopConversation = z.infer<typeof topConversationSchema>;
+
 export const usageStatsSchema = z.object({
   range: statsRangeSchema,
   /** Nominal bin duration in ms (DST days may be 23h or 25h; each bin carries its exact start/end). */
@@ -465,6 +646,8 @@ export const usageStatsSchema = z.object({
   models: z.array(usageTotalsSchema.extend({ label: z.string(), pricingKey: z.string() })),
   /** Per attributed account (only conversations launched while this plugin observed them carry an account id). */
   accounts: z.array(usageAccountBreakdownSchema),
+  /** Top conversations in the selected range/filter, highest cost / tokens first. */
+  topConversations: z.array(topConversationSchema),
   conversations: z.number().int().nonnegative(),
   /** True when at least one custom price override is currently configured. */
   hasCustomPricing: z.boolean(),
@@ -779,13 +962,15 @@ export const subagentDetailRpc = defineRpc({
   output: subagentDetailSchema,
 });
 
+export const artifactPathSchema = z.string().min(1).max(1024);
+
 export const subagentArtifactRpc = defineRpc({
   name: "subagents.artifact",
   input: z
     .object({
       agentId: z.string().min(1).max(200),
       subagentId: z.string().regex(/^[0-9a-f-]{36}$/i),
-      path: z.string().min(1).max(300),
+      path: artifactPathSchema,
     })
     .strict(),
   output: z.object({
@@ -831,3 +1016,161 @@ export const askQuestionCardSchema = z.object({
   status: z.enum(["running", "completed", "failed", "canceled"]),
 });
 export type AskQuestionCard = z.infer<typeof askQuestionCardSchema>;
+
+// ---- Artifacts & Composer Attachments ------------------------------------------------------
+
+export const artifactKindSchema = z.enum(["markdown", "image", "code", "text", "binary"]);
+export type ArtifactKind = z.infer<typeof artifactKindSchema>;
+
+export const agentArtifactInfoSchema = z.object({
+  conversationId: z.string(),
+  owner: z.enum(["main", "subagent"]),
+  ownerLabel: z.string().nullable(),
+  /** Relative path inside the conversation's brain directory. */
+  path: z.string(),
+  name: z.string(),
+  size: z.number().int().nonnegative(),
+  updatedAt: z.string(),
+  kind: artifactKindSchema,
+  displayPath: z.string(),
+});
+export type AgentArtifactInfo = z.infer<typeof agentArtifactInfoSchema>;
+
+export const listAgentArtifactsRpc = defineRpc({
+  name: "artifacts.list",
+  input: z.object({ agentId: z.string().min(1).max(200) }).strict(),
+  output: z.object({
+    conversationId: z.string().nullable(),
+    items: z.array(agentArtifactInfoSchema),
+  }),
+});
+
+export const readAgentArtifactRpc = defineRpc({
+  name: "artifacts.read",
+  input: z
+    .object({
+      agentId: z.string().min(1).max(200),
+      conversationId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
+      path: artifactPathSchema,
+    })
+    .strict(),
+  output: z.object({
+    path: z.string(),
+    displayPath: z.string(),
+    kind: artifactKindSchema,
+    size: z.number().int().nonnegative(),
+    content: z.string().nullable(),
+    dataUri: z.string().nullable(),
+    truncated: z.boolean(),
+    tooLarge: z.boolean(),
+  }),
+});
+
+export const attachmentItemSchema = z.object({
+  id: z.string(),
+  identifier: z.string(),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  url: z.string().url(),
+  text: z.string(),
+  resourceType: z.string(),
+});
+
+export const searchArtifactsAttachmentRpc = defineRpc({
+  name: "artifacts.search",
+  input: z.object({ query: z.string() }),
+  output: z.object({
+    items: z.array(attachmentItemSchema),
+  }),
+});
+
+// ---- Native Tool Cards & Live Task Checklist -----------------------------------------------
+
+export const stepStatusSchema = z.enum(["pending", "in_progress", "done", "skipped", "failed"]);
+export type StepStatus = z.infer<typeof stepStatusSchema>;
+
+export const agentStepSchema = z.object({
+  title: z.string(),
+  status: stepStatusSchema,
+});
+export type AgentStep = z.infer<typeof agentStepSchema>;
+
+const updateStepsInput = z.array(agentStepSchema.extend({ title: z.string().trim().min(1) }).strict());
+
+export function parseStrictUpdateSteps(raw: unknown): AgentStep[] | null {
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  const result = updateStepsInput.safeParse(raw);
+  return result.success ? result.data : null;
+}
+
+export function parseUpdateStepsInput(input: unknown): AgentStep[] | null {
+  if (!input || typeof input !== "object" || Object.keys(input).length !== 1 || !Object.hasOwn(input, "steps")) return null;
+  return parseStrictUpdateSteps((input as { steps: unknown }).steps);
+}
+
+export function isUpdateStepsSuccessOutput(output: unknown): boolean {
+  if (output == null) return true;
+  if (typeof output !== "string") return false;
+  const body = output.trim().replace(/^(?:(?:Created|Completed) At: [^\r\n]+\r?\n)+/, "").trim();
+  return !body || body === "OK";
+}
+
+/** Bind a provider-issued call id to its normalized steps as a legacy Round 3 receipt check. */
+export function updateStepsReceipt(callId: string, steps: readonly AgentStep[]): string {
+  const text = JSON.stringify(steps);
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  return callId + "/" + (hash >>> 0).toString(36);
+}
+
+export const taskSnapshotSchema = z.object({
+  planId: z.string(),
+  revision: z.number().int().nonnegative(),
+  steps: z.array(agentStepSchema),
+});
+export type TaskSnapshot = z.infer<typeof taskSnapshotSchema>;
+
+export const UPDATE_STEPS_TIMELINE_KIND = "antigravity-update-steps";
+export const COMPACT_TOOL_TIMELINE_KIND = "antigravity-compact-tool";
+
+export const updateStepsCardSchema = z.object({
+  coveredCalls: z.array(z.string()).optional(),
+  counts: z.object({ total: z.number().int(), done: z.number().int(), failed: z.number().int() }).optional(),
+  planId: z.string().optional(),
+  revision: z.number().int().nonnegative().optional(),
+  callId: z.string().optional(),
+  steps: z.array(agentStepSchema),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+  error: z.string().nullable().optional(),
+});
+export type UpdateStepsCard = z.infer<typeof updateStepsCardSchema>;
+
+export const compactToolCardSchema = z.object({
+  tool: z.enum(["schedule", "run_workflow", "send_message"]),
+  variant: z.enum(["cron", "timer", "default"]).optional(),
+  expr: z.string().nullable().optional(),
+  target: z.string().nullable().optional(),
+  label: z.string().nullable().optional(),
+  title: z.string().optional(),
+  subtitle: z.string().nullable(),
+  detail: z.string().nullable(),
+  output: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
+export type CompactToolCard = z.infer<typeof compactToolCardSchema>;
+
+export const agentTasksRpc = defineRpc({
+  name: "tasks.latest",
+  input: z.object({ agentIds: z.array(z.string().min(1).max(200)).max(200) }).strict(),
+  output: z.object({
+    tasks: z.record(z.string(), taskSnapshotSchema.nullable()),
+    /** Agent IDs whose transcript was temporarily unreadable; clients keep the previous confirmed snapshot. */
+    unavailable: z.array(z.string()).optional(),
+  }),
+});

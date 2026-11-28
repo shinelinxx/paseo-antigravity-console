@@ -27,13 +27,10 @@
   },
   "badgeDefault": "Default",
   "badgeNoFallback": "Manual only",
-  "badgeWeightAuto": "Weight {{weight}}x · auto",
-  "badgeWeightCustom": "Weight {{weight}}x",
-  "badgeWeightWithShare": "Weight {{weight}}x · ~{{share}}",
-  "badgeWeightOff": "Excluded from balancing",
   "badgeCustomOrchestrator": "Custom orchestrator",
   "badgeCooldown": "Cooling down ({{pool}}, {{time}})",
   "cooldownPool": {
+    "unknown": "default model",
     "all": "account",
     "gemini": "Gemini",
     "third-party": "Claude / GPT"
@@ -53,19 +50,19 @@
     "monthly": "Monthly"
   },
   "resets": "Resets {{time}}",
-  "resetting": "Resetting soon",
   "off": "Off",
   "noQuota": "No quota reported",
   "action": {
     "more": "More actions",
     "refresh": "Refresh",
     "rename": "Rename",
+    "addNote": "Add note…",
+    "editNote": "Edit note…",
     "makeDefault": "Use for new agents",
     "moveUp": "Move up in priority",
     "moveDown": "Move down in priority",
     "enableFallback": "Include in auto-switch",
     "disableFallback": "Exclude from auto-switch",
-    "setWeight": "Load-balancing weight…",
     "clearCooldown": "Clear cooldown",
     "orchestratorOverride": "Orchestrator models…",
     "recoverFiles": "Saved home files…",
@@ -73,7 +70,8 @@
     "signIn": "Sign in",
     "signInAgain": "Sign in again",
     "signOut": "Sign out",
-    "remove": "Remove account"
+    "remove": "Remove account",
+    "setWeight": "Load-balancing weight…"
   },
   "callout": {
     "signedOutTitle": "Not signed in",
@@ -87,6 +85,11 @@
   "dialog": {
     "addTitle": "Add account",
     "renameTitle": "Rename account",
+    "noteTitle": "Note for “{{label}}”",
+    "noteHint": "Short tag shown on the card, sidebar popover, and account pickers.",
+    "noteLabel": "Note",
+    "notePlaceholder": "e.g. Main, Claude only, Backup Ultra",
+    "noteClear": "Clear",
     "name": "Name",
     "namePlaceholder": "Work",
     "continue": "Continue",
@@ -157,17 +160,26 @@
     "singleLine": "Paste a single line: the code or the page URL."
   },
   "account": "Account",
-  "composerAuto": "Auto balance",
-  "composerAutoDesc": "Route by plan weight (Ultra 20x / Pro 1x) & quota; stays sticky after creation",
   "composerDescription": "{{detail}} · {{status}}",
+  "modelUnsupported": "Model not supported",
+  "coolingShort": "Cooling down",
+  "auto": {
+    "label": "Auto",
+    "option": "Auto (pick by strategy)",
+    "badge": "Auto",
+    "description": "Pick the best available account for each model",
+    "composerDescription": "Auto-pick by strategy (currently {{account}})",
+    "resolvedHint": "Currently picking “{{label}}” based on your selection strategy.",
+    "noEligible": "No eligible account for automatic routing."
+  },
   "pill": "Antigravity account",
   "pillSignedOut": "Antigravity account (not signed in)",
-  "pillCooling": "Cooling down",
   "manage": "Manage accounts…",
   "now": "Switch now (interrupts the turn)",
   "after": "Switch after this turn",
   "switched": "Switched to “{{label}}”",
   "scheduled": "Will switch to “{{label}}” after this turn",
+  "busy": "This agent changed state. Try switching again.",
   "unchanged": "Already on “{{label}}”",
   "slash": "Show or switch this agent's Antigravity account",
   "hint": "[account name or number]",
@@ -193,7 +205,13 @@
     "updated": "Updated {{time}}",
     "updatedJustNow": "Updated just now",
     "note": "Latest model call.",
-    "none": "No model calls yet."
+    "none": "No model calls yet.",
+    "sessionTitle": "This conversation",
+    "sessionRequests": "Requests",
+    "sessionTokens": "Total tokens",
+    "sessionCacheShare": "{{pct}} cached",
+    "sessionCost": "Est. cost",
+    "sessionPricedShare": "{{priced}}/{{total}} priced"
   },
   "stats": {
     "title": "Usage",
@@ -222,10 +240,6 @@
     "costAvgCustom": "Avg {{avg}} / req · custom",
     "costWithUnpriced": "{{avg}} / req · {{unpriced}} unpriced",
     "accountAll": "All accounts",
-    "accountUnattributed": "Unattributed",
-    "accountsTable": "By account",
-    "accountsHint": "Tap an account to filter the whole dashboard",
-    "colAccount": "Account",
     "windowSince": "{{start}} – now",
     "filterModel": "Model: {{model}}",
     "splitSummary": "Main {{main}} · Subagents {{subagent}}",
@@ -252,6 +266,9 @@
     "empty": "No Antigravity requests in this period",
     "models": "By model",
     "modelsHint": "Tap a model to filter the whole dashboard",
+    "topConversations": "Top conversations",
+    "showAllConversations": "Show all {{count}} conversations",
+    "mixedAccounts": "Multiple accounts",
     "tps": "{{value}} tok/s",
     "col": {
       "model": "Model",
@@ -281,7 +298,11 @@
       "streak": "Current streak",
       "days_one": "{{count}} day",
       "days_other": "{{count}} days"
-    }
+    },
+    "accountUnattributed": "Unattributed",
+    "accountsTable": "By account",
+    "accountsHint": "Tap an account to filter the whole dashboard",
+    "colAccount": "Account"
   },
   "pricing": {
     "button": "API pricing",
@@ -311,17 +332,14 @@
     "editFor": "Edit API price for {{model}}"
   },
   "sidebar": {
-    "label": "Antigravity: {{fiveHour}} of the 5-hour quota and {{weekly}} of the weekly quota left"
+    "label": "Antigravity: {{fiveHour}} of the 5-hour quota and {{weekly}} of the weekly quota left",
+    "openConsole": "Console",
+    "setDefault": "Default",
+    "signedInSummary": "{{signedIn}} of {{total}} signed in",
+    "autoOn": "Auto routing on",
+    "autoOff": "Enable auto routing"
   },
   "settings": {
-    "routingMode": "New session load balancing",
-    "routingModeDefault": "Off (fixed default account)",
-    "routingModeBalanced": "Weighted load balancing (recommended)",
-    "routingModeCapacity": "Weighted capacity-first",
-    "routingReserve": "Reserve quota floor",
-    "routingReserveOff": "None (0%)",
-    "routingReservePct": "{{pct}}% (prefer accounts above floor)",
-    "routingStickyNote": "Balances new sessions by plan weight (Ultra 20x / Pro 1x), remaining quota, and concurrency. Existing sessions stay sticky to keep prompt cache warm and only switch on exhaustion or errors.",
     "fallback": "Switch account on errors",
     "retries": "Retries before switching",
     "retryNone": "None",
@@ -330,15 +348,29 @@
     "strategy": "Account selection strategy",
     "strategyOrder": "Priority order",
     "strategyQuota": "Most remaining quota",
-    "strategyWeighted": "Weighted remaining quota",
-    "strategyReset": "Soonest quota reset"
+    "strategyReset": "Soonest quota reset",
+    "preemptive": "Proactive low-quota switch",
+    "preemptiveHint": "When a session is created or reopened, switch to an account with more quota if this model’s pool is at or below the threshold. Active turns continue uninterrupted.",
+    "preemptiveOff": "Off",
+    "preemptivePct": "At or below {{pct}}%",
+    "routingMode": "New session load balancing",
+    "routingModeDefault": "Off (fixed default account)",
+    "routingModeBalanced": "Weighted load balancing (recommended)",
+    "routingModeCapacity": "Weighted capacity-first",
+    "routingReserve": "Reserve quota floor",
+    "routingReserveOff": "None (0%)",
+    "routingReservePct": "{{pct}}% (prefer accounts above floor)",
+    "routingStickyNote": "Balances new sessions by plan weight (Ultra 20x / Pro 1x), remaining quota, and concurrency. Existing sessions stay sticky to keep prompt cache warm and only switch on exhaustion or errors.",
+    "strategyWeighted": "Weighted remaining quota"
   },
   "fallback": {
     "switch": "{{from}}: {{reason}}. Switched to {{to}} and continued.",
+    "preemptive": "{{from}} quota is running low. Switched to {{to}} for the next turn.",
     "retry": "{{from}} failed. Retrying ({{attempt}}/{{retries}}).",
     "exhausted": "No Antigravity account can take over. Automatic switching stopped.",
     "reason": {
       "quota": "quota used up",
+      "low-quota": "quota running low",
       "auth": "sign-in rejected",
       "transient": "repeated errors",
       "error": "repeated errors"
@@ -462,5 +494,56 @@
     "insertedComposer": "Answer inserted into composer",
     "answered": "Answered",
     "skipped": "Skipped"
-  }
+  },
+  "artifacts": {
+    "err": {
+      "invalidPath": "Invalid artifact path or conversation ID.",
+      "noConversation": "This agent has no conversation yet.",
+      "notOwned": "This artifact belongs to another conversation.",
+      "unreadable": "Could not read this artifact."
+    },
+    "title": "Artifacts",
+    "commandOpen": "Open Antigravity artifacts",
+    "attachTitle": "Antigravity artifact",
+    "attachPickerTitle": "Attach Antigravity artifact or report",
+    "attachSearchPlaceholder": "Search recent artifacts and subagent reports…",
+    "ownerMain": "Main",
+    "ownerSubagent": "Subagent",
+    "empty": "This agent has no artifacts yet",
+    "pick": "Select an artifact",
+    "searchPlaceholder": "Filter artifacts…",
+    "copyPath": "Copy path",
+    "pathCopied": "Path copied",
+    "copyContent": "Copy content",
+    "contentCopied": "Content copied",
+    "insertComposer": "Insert into composer",
+    "insertedComposer": "Inserted into composer",
+    "imageTooLarge": "Image exceeds the 2 MB inline preview limit. Copy its path to open it locally.",
+    "binaryNotice": "Binary file preview is not supported. Copy its path to open it locally."
+  },
+  "tasks": {
+    "title": "Tasks",
+    "empty": "No task checklist recorded for this agent.",
+    "cleared": "Task checklist cleared",
+    "showingFirst": "Showing the first {{count}} steps",
+    "updateFailed": "Task checklist update failed",
+    "updateCanceled": "Task checklist update canceled"
+  },
+  "tools": {
+    "schedule": "Schedule",
+    "scheduleCron": "Schedule ({{expr}})",
+    "scheduleTimer": "Timer ({{expr}})",
+    "workflow": "Run workflow",
+    "workflowNamed": "Workflow · {{name}}",
+    "message": "Send message",
+    "messageTo": "Message → {{target}}"
+  },
+  "badgeWeightAuto": "Weight {{weight}}x · auto",
+  "badgeWeightCustom": "Weight {{weight}}x",
+  "badgeWeightWithShare": "Weight {{weight}}x · ~{{share}}",
+  "badgeWeightOff": "Excluded from balancing",
+  "resetting": "Resetting soon",
+  "composerAuto": "Auto balance",
+  "composerAutoDesc": "Route by plan weight (Ultra 20x / Pro 1x) & quota; stays sticky after creation",
+  "pillCooling": "Cooling down"
 }

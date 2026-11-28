@@ -9,6 +9,7 @@ import {
   type AccountSummary,
   type StatsRange,
   type StatsScope,
+  type TopConversation,
   type UsageStats,
   type UsageTotals,
 } from "../shared/contracts";
@@ -18,7 +19,7 @@ import { displayLabel } from "./labels";
 import { messages } from "./messages";
 import { PricingDialog } from "./pricing";
 import { font, radius, space, tabular, tint, type Colors } from "./theme";
-import { Bar, Button, Card, Muted } from "./ui";
+import { Badge, Bar, Button, Card, Muted } from "./ui";
 
 type PressState = { pressed: boolean; hovered?: boolean };
 type ChartMetric = "tokens" | "cost" | "requests" | "tps" | "cache" | "firstToken";
@@ -575,7 +576,7 @@ const MetricChart = memo(function MetricChart({
                   borderWidth: 1,
                   borderColor: colors.border,
                   backgroundColor: colors.surface0,
-                  shadowColor: "#000",
+                  shadowColor: colors.foreground,
                   shadowOpacity: 0.12,
                   shadowRadius: 10,
                   shadowOffset: { width: 0, height: 4 },
@@ -1252,16 +1253,165 @@ const AccountTable = memo(function AccountTable({
   );
 });
 
+type TopConvSort = "cost" | "tokens" | "requests";
+
+const TopConversationsCard = memo(function TopConversationsCard({
+  colors,
+  conversations,
+  accountKindById,
+  locale,
+  compact,
+  onOpenAgent,
+}: {
+  colors: Colors;
+  conversations: readonly TopConversation[];
+  accountKindById: ReadonlyMap<string, AccountSummary["kind"]>;
+  locale: string;
+  compact: boolean;
+  onOpenAgent?: (agentId: string) => void;
+}) {
+  const { t } = useTranslation(messages);
+  const [sortBy, setSortBy] = useState<TopConvSort>("cost");
+  const [expanded, setExpanded] = useState(false);
+
+  const sorted = useMemo(() => {
+    const list = [...conversations];
+    list.sort((left, right) => {
+      if (sortBy === "requests") return right.requests - left.requests || right.cost - left.cost;
+      if (sortBy === "tokens") {
+        const lt = left.input + left.cached + left.output;
+        const rt = right.input + right.cached + right.output;
+        return rt - lt || right.cost - left.cost;
+      }
+      return right.cost - left.cost || right.input + right.cached + right.output - (left.input + left.cached + left.output);
+    });
+    return list.slice(0, 15);
+  }, [conversations, sortBy]);
+
+  const visible = expanded ? sorted : sorted.slice(0, 5);
+  const hasMore = sorted.length > 5;
+
+  return (
+    <Card colors={colors} style={{ padding: space.lg, gap: space.sm }}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm, marginBottom: space.xs }}>
+        <Text style={{ ...font.heading, color: colors.foreground, flex: 1, minWidth: 120 }}>
+          {t("stats.topConversations")}
+        </Text>
+        <SegmentedControl<TopConvSort>
+          colors={colors}
+          value={sortBy}
+          options={[
+            { value: "cost", label: t("stats.col.cost") },
+            { value: "tokens", label: t("stats.col.tokens") },
+            { value: "requests", label: t("stats.col.requests") },
+          ]}
+          onChange={setSortBy}
+        />
+      </View>
+
+      <View>
+        {visible.map((conv, index) => {
+          const totalTokens = conv.input + conv.cached + conv.output;
+          const title = conv.title ?? conv.workspaceName ?? conv.conversationId.slice(0, 8);
+          const accountText = conv.mixedAccounts
+            ? t("stats.mixedAccounts")
+            : conv.accountId && conv.accountId !== UNATTRIBUTED_ACCOUNT_ID && conv.accountLabel
+              ? displayLabel(conv.accountLabel, t, accountKindById.get(conv.accountId))
+              : null;
+          const meta = [
+            conv.title && conv.workspaceName ? conv.workspaceName : null,
+            conv.primaryModel,
+            accountText,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          const openable = Boolean(conv.agentId && onOpenAgent);
+          return (
+            <View
+              key={conv.conversationId}
+              style={{
+                flexDirection: compact ? "column" : "row",
+                alignItems: compact ? "stretch" : "center",
+                gap: compact ? space.xs : space.md,
+                paddingVertical: space.sm + 2,
+                borderTopWidth: index === 0 ? 0 : 1,
+                borderTopColor: tint(colors.foreground, 0.06),
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+                  <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
+                    {title}
+                  </Text>
+                  {conv.isSubagent ? <Badge colors={colors} label={t("stats.scope.subagent")} /> : null}
+                </View>
+                {meta ? (
+                  <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
+                    {meta}
+                  </Text>
+                ) : null}
+              </View>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
+                <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                  {t("stats.readoutRequests", { count: conv.requests, value: integer(conv.requests, locale) })}
+                </Text>
+                <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted, minWidth: 52, textAlign: "right" }}>
+                  {tokens(totalTokens)}
+                </Text>
+                <Text numberOfLines={1} style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground, minWidth: 64, textAlign: "right" }}>
+                  {conv.pricedRequests > 0 ? usdFixed(conv.cost, locale) : "—"}
+                </Text>
+                {openable ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t("dialog.agentsOpen")}
+                    onPress={() => onOpenAgent?.(conv.agentId!)}
+                    style={(state) => ({
+                      paddingHorizontal: space.sm,
+                      height: 26,
+                      borderRadius: radius.sm,
+                      justifyContent: "center",
+                      backgroundColor: (state as PressState).hovered ? tint(colors.accent, 0.14) : tint(colors.accent, 0.08),
+                    })}
+                  >
+                    <Text style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
+                      {t("dialog.agentsOpen")}
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            </View>
+          );
+        })}
+      </View>
+
+      {hasMore ? (
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => setExpanded((current) => !current)}
+          style={{ alignSelf: "flex-start", paddingTop: space.xs }}
+        >
+          <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+            {expanded ? t("subagents.less") : t("stats.showAllConversations", { count: sorted.length })}
+          </Text>
+        </Pressable>
+      ) : null}
+    </Card>
+  );
+});
+
 export const UsageSection = memo(function UsageSection({
   colors,
   width,
   compact,
   accounts,
+  onOpenAgent,
 }: {
   colors: Colors;
   width: number;
   compact: boolean;
   accounts: readonly AccountSummary[];
+  onOpenAgent?: (agentId: string) => void;
 }) {
   const { t, locale } = useTranslation(messages);
   const [range, setRange] = useState<StatsRange>("24h");
@@ -1615,6 +1765,16 @@ export const UsageSection = memo(function UsageSection({
             selectedModel={selectedModel}
             onSelectModel={setSelectedModel}
             onEditPricing={handleEditPricing}
+          />
+        ) : null}
+        {stats && stats.totals.requests > 0 && stats.topConversations.length > 0 ? (
+          <TopConversationsCard
+            colors={colors}
+            conversations={stats.topConversations}
+            accountKindById={accountKindById}
+            locale={locale}
+            compact={compact || width < 640}
+            onOpenAgent={onOpenAgent}
           />
         ) : null}
       </View>

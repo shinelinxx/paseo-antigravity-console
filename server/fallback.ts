@@ -1,11 +1,11 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
-  ACCOUNT_METADATA_KEY,
   FALLBACK_TIMELINE_KIND,
   SYSTEM_ACCOUNT_ID,
-  accountIdFromMetadata,
   isAntigravityProvider,
+  pendingSwitchFromMetadata,
   quotaPoolForModel,
+  runtimeAccountFromMetadata,
   type AccountCooldown,
   type AccountSummary,
   type FallbackEvent,
@@ -16,9 +16,24 @@ import {
 import type { AccountService } from "./accounts";
 import { switchAgentAccount, type PendingSwitches } from "./hooks";
 import { computeEffectiveWeight, evaluatePoolQuota } from "./router";
+import { orderedAccountIds } from "./store";
 import type { PaseoApi } from "./types";
 
 export type FailureKind = FallbackEvent["reason"];
+
+async function awaitWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(resolve, ms, undefined);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** The prompt that resumes an agent after a retry or an account switch; the conversation carries the task. */
 const RESUME_PROMPT = "Continue.";
@@ -46,13 +61,24 @@ interface Chain {
 interface CooldownEntry {
   until: number;
   reason: FailureKind;
+  baseline?: ReturnType<typeof quotaSnapshot>;
 }
 
-interface AccountCooldownState {
-  all?: CooldownEntry;
-  gemini?: CooldownEntry;
-  "third-party"?: CooldownEntry;
+function quotaSnapshot(groups: QuotaGroup[] | null) {
+  const buckets = new Map<string, { fraction: number | null; reset: number }>();
+  for (const group of groups ?? []) {
+    for (const bucket of group.buckets) {
+      if (bucket.disabled) continue;
+      buckets.set(JSON.stringify([group.name, bucket.id, bucket.window]), {
+        fraction: bucket.remainingFraction,
+        reset: Date.parse(bucket.resetTime ?? ""),
+      });
+    }
+  }
+  return buckets;
 }
+
+type AccountCooldownState = Partial<Record<QuotaPool, CooldownEntry>>;
 
 export interface ModelSupport {
   supportsModel(accountId: string, model: string | null | undefined): boolean | null;
@@ -72,7 +98,11 @@ export function groupForPool(
       null
     );
   }
-  return groups.find((group) => /gemini/i.test(group.name) && !/argon/i.test(group.name)) ?? groups[0] ?? null;
+  return (
+    groups.find((group) => /gemini/i.test(group.name) && !/argon/i.test(group.name)) ??
+    groups.find((group) => !/claude|gpt|3p|third/i.test(group.name)) ??
+    null
+  );
 }
 
 /** Earliest future reset among exhausted buckets in the target pool, else null. */
@@ -107,24 +137,13 @@ export function exhausted(
   });
 }
 
-/** True when any active bucket has a reset timestamp that has already passed. */
-function hasExpiredReset(groups: readonly QuotaGroup[] | null, now = Date.now()): boolean {
-  for (const group of groups ?? []) {
-    for (const bucket of group.buckets) {
-      if (bucket.disabled || !bucket.resetTime) continue;
-      const resetAt = Date.parse(bucket.resetTime);
-      if (Number.isFinite(resetAt) && resetAt <= now) return true;
-    }
-  }
-  return false;
-}
-
 /** Minimum remaining fraction (0..1) across active buckets of `pool`, or -1 when unknown. */
 function poolRemainingScore(
   groups: readonly QuotaGroup[] | null,
-  pool: "gemini" | "third-party",
+  pool: "gemini" | "third-party" | null,
   now = Date.now(),
 ): number {
+  if (!pool) return Math.max(poolRemainingScore(groups, "gemini", now), poolRemainingScore(groups, "third-party", now));
   const group = groupForPool(groups, pool);
   const fractions = (group?.buckets ?? [])
     .filter((bucket) => !bucket.disabled && bucket.remainingFraction !== null)
@@ -137,7 +156,12 @@ function poolRemainingScore(
 }
 
 /** Earliest future reset timestamp among active non-empty buckets of `pool`, or Infinity when unknown. */
-function poolSoonestReset(groups: readonly QuotaGroup[] | null, pool: "gemini" | "third-party", now = Date.now()): number {
+function poolSoonestReset(
+  groups: readonly QuotaGroup[] | null,
+  pool: "gemini" | "third-party" | null,
+  now = Date.now(),
+): number {
+  if (!pool) return Math.min(poolSoonestReset(groups, "gemini", now), poolSoonestReset(groups, "third-party", now));
   const group = groupForPool(groups, pool);
   let soonest = Infinity;
   for (const bucket of group?.buckets ?? []) {
@@ -148,13 +172,35 @@ function poolSoonestReset(groups: readonly QuotaGroup[] | null, pool: "gemini" |
   return soonest;
 }
 
+/** Effective weighted quota score (`effectiveWeight * remainingFraction^alpha * urgency`) for fallback sorting. */
+function weightedPoolScore(
+  groups: readonly QuotaGroup[] | null,
+  effectiveWeight: number,
+  pool: "gemini" | "third-party" | null,
+  now = Date.now(),
+): number {
+  const baseWeight = effectiveWeight > 0 ? effectiveWeight : 0.01;
+  if (!pool) {
+    return Math.max(
+      computeEffectiveWeight({ baseWeight, metrics: evaluatePoolQuota(groups, "gemini", now) }),
+      computeEffectiveWeight({ baseWeight, metrics: evaluatePoolQuota(groups, "third-party", now) }),
+    );
+  }
+  return computeEffectiveWeight({ baseWeight, metrics: evaluatePoolQuota(groups, pool, now) });
+}
+
 export class FallbackController {
   private readonly chains = new Map<string, Chain>();
   /** Account id → active cooldowns (whole account or per quota pool). */
   private readonly cooldowns = new Map<string, AccountCooldownState>();
   /** Per-agent pending retry timer, canceled when a new turn starts or completes. */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
-  private readonly redirectTimers = new Set<NodeJS.Timeout>();
+  private readonly latestTurn = new Map<string, string>();
+  private readonly turnGen = new Map<string, number>();
+  // The matching open belongs to this chain and must not cancel its next candidate.
+  private readonly onReloadOpen = new Map<string, string>();
+  private sequence = 0;
+  private disposed = false;
   private noteSeq = 0;
 
   constructor(
@@ -163,6 +209,7 @@ export class FallbackController {
     private readonly models?: ModelSupport,
   ) {
     this.service.setCooldownProvider((accountId) => this.cooldownsOf(accountId));
+    this.service.setDefaultResolver((accounts, strategy) => this.pickBestSync(accounts, null, strategy));
   }
 
   /** Active (non-expired) cooldown entries for an account. */
@@ -171,7 +218,7 @@ export class FallbackController {
     if (!entry) return [];
     const now = Date.now();
     const active: AccountCooldown[] = [];
-    for (const pool of ["all", "gemini", "third-party"] as const) {
+    for (const pool of ["all", "unknown", "gemini", "third-party"] as const) {
       const item = entry[pool];
       if (!item) continue;
       if (item.until <= now) {
@@ -180,16 +227,17 @@ export class FallbackController {
       }
       active.push({ pool, reason: item.reason, until: new Date(item.until).toISOString() });
     }
-    if (!entry.all && !entry.gemini && !entry["third-party"]) this.cooldowns.delete(accountId);
+    if (!active.length) this.cooldowns.delete(accountId);
     return active;
   }
 
   /** True when the account is currently cooling down for `pool` (or globally). */
-  isCooling(accountId: string, pool: "gemini" | "third-party"): boolean {
+  isCooling(accountId: string, pool: "gemini" | "third-party" | null): boolean {
     return this.activeCooldown(accountId, pool) !== null;
   }
 
-  private activeCooldown(accountId: string, pool: "gemini" | "third-party"): CooldownEntry | null {
+  private activeCooldown(accountId: string, pool: QuotaPool | null): CooldownEntry | null {
+    pool ??= "unknown";
     const entry = this.cooldowns.get(accountId);
     if (!entry) return null;
     const now = Date.now();
@@ -202,52 +250,85 @@ export class FallbackController {
       if (pooled.until > now) return pooled;
       delete entry[pool];
     }
-    if (!entry.all && !entry.gemini && !entry["third-party"]) this.cooldowns.delete(accountId);
+    if (!Object.keys(entry).length) this.cooldowns.delete(accountId);
     return null;
   }
 
   private setCooldown(accountId: string, pool: QuotaPool, until: number, reason: FailureKind): void {
     const entry = this.cooldowns.get(accountId) ?? {};
-    entry[pool] = { until, reason };
+    entry[pool] = {
+      until,
+      reason,
+      baseline: pool === "unknown" && reason === "quota" ? quotaSnapshot(this.service.knownQuota(accountId)) : undefined,
+    };
     this.cooldowns.set(accountId, entry);
     this.service.notifyChange();
   }
 
   /** Clears active cooldowns for one account (or all accounts when omitted). */
-  clearCooldown(accountId?: string): boolean {
+  clearCooldown(accountId?: string, clearRedirects = true): boolean {
+    const clearedRedirect = clearRedirects && this.pending.clearFailedRedirects(accountId);
     if (!accountId) {
-      if (this.cooldowns.size === 0) return false;
+      if (!this.cooldowns.size && !clearedRedirect) return false;
       this.cooldowns.clear();
       this.service.notifyChange();
       return true;
     }
-    const removed = this.cooldowns.delete(accountId);
+    const removed = this.cooldowns.delete(accountId) || clearedRedirect;
     if (removed) this.service.notifyChange();
     return removed;
   }
 
   /** Automatically clears cooldowns that fresh account status proves have resolved. */
-  reconcileStatus(accountId: string, status: AccountSummary["status"], quota: QuotaGroup[] | null): void {
-    const entry = this.cooldowns.get(accountId);
-    if (!entry || status !== "signed-in") return;
+  reconcileStatus(
+    accountId: string,
+    status: AccountSummary["status"],
+    quota: QuotaGroup[] | null,
+    identityChanged = false,
+  ): void {
+    if (identityChanged || status === "signed-out") this.pending.clearFailedRedirects(accountId);
+    const entry = this.cooldowns.get(accountId) ?? {};
     let changed = false;
-    if (entry.all?.reason === "auth") {
+    if (entry.unknown) {
+      const baseline = entry.unknown.baseline;
+      const reset =
+        status === "signed-in" &&
+        baseline &&
+        [...quotaSnapshot(quota)].some(([key, now]) => {
+          const old = baseline.get(key);
+          return (
+            old &&
+            ((Date.now() >= old.reset && now.reset > old.reset + 60_000) ||
+              (old.fraction !== null && now.fraction !== null && now.fraction >= old.fraction + 0.05 - Number.EPSILON))
+          );
+        });
+      if (status === "signed-out" || identityChanged || reset) {
+        delete entry.unknown;
+        changed = true;
+      }
+    }
+    if (status === "signed-in" && entry.all?.reason === "auth") {
       delete entry.all;
       changed = true;
     }
     for (const pool of ["gemini", "third-party"] as const) {
-      if (entry[pool]?.reason === "quota" && !exhausted(quota, pool) && poolRemainingScore(quota, pool) > 0.01) {
+      if (
+        status === "signed-in" &&
+        entry[pool]?.reason === "quota" &&
+        !exhausted(quota, pool) &&
+        poolRemainingScore(quota, pool) > 0.01
+      ) {
         delete entry[pool];
         changed = true;
       }
     }
-    if (!entry.all && !entry.gemini && !entry["third-party"]) this.cooldowns.delete(accountId);
+    if (!Object.keys(entry).length) this.cooldowns.delete(accountId);
     if (changed) this.service.notifyChange();
   }
 
-  /** Cancels any pending automatic retry and resets the failure chain for an agent (e.g. manual switch). */
+  /** Cancels any pending automatic retry and resets the failure chain for an agent. */
   cancelAgent(agentId: string): void {
-    this.cancelRetry(agentId);
+    this.invalidatePreemptive(agentId);
     this.chains.delete(agentId);
   }
 
@@ -266,57 +347,170 @@ export class FallbackController {
     }
   }
 
-  register(server: PluginServerContext): () => void {
+  invalidatePreemptive(agentId: string): void {
+    this.onReloadOpen.delete(agentId);
+    this.turnGen.set(agentId, ++this.sequence);
+    this.cancelRetry(agentId);
+  }
+
+  private cancellation(agentId: string) {
+    // Reserve an identity even for an agent first observed at turn.after.
+    if (!this.turnGen.has(agentId)) this.turnGen.set(agentId, ++this.sequence);
+    const gen = this.turnGen.get(agentId);
+    return () => this.disposed || this.turnGen.get(agentId) !== gen;
+  }
+
+  register(server: PluginServerContext, registerSessionHooks?: () => Array<() => void>): () => void {
     const removers = [
-      this.service.onStatusUpdated(({ accountId, status, quota }) => {
-        this.reconcileStatus(accountId, status, quota);
+      this.service.onStatusUpdated(({ accountId, status, quota, identityChanged }) => {
+        this.reconcileStatus(accountId, status, quota, identityChanged);
       }),
-      server.addHook("agent.turn.before", async ({ agent }) => {
+      server.addHook("agent.open.before", async ({ request }) => {
+        if (request.purpose === "history" || !isAntigravityProvider(request.provider)) return;
+        const own = this.onReloadOpen.get(request.agentId);
+        if (own && own === pendingSwitchFromMetadata(request.metadata)?.requestId) {
+          this.onReloadOpen.delete(request.agentId);
+          return;
+        }
+        this.invalidatePreemptive(request.agentId);
+      }),
+      server.addHook("agent.turn.before", async ({ agent, turnId }) => {
         if (!isAntigravityProvider(agent.provider)) return;
-        this.cancelRetry(agent.id);
+        this.invalidatePreemptive(agent.id);
+        if (turnId) this.latestTurn.set(agent.id, turnId);
+        else this.latestTurn.delete(agent.id);
       }),
       server.addHook("agent.archive.after", async ({ agent }) => {
         this.cancelRetry(agent.id);
+        this.onReloadOpen.delete(agent.id);
+        this.turnGen.delete(agent.id);
+        this.latestTurn.delete(agent.id);
         this.chains.delete(agent.id);
       }),
-      server.addHook("agent.turn.after", async ({ agent, outcome }, { paseo }) => {
+      // Invalidate old work on entry; confirm and attribute the finished turn
+      // before its failure handler can open another provider session.
+      ...(registerSessionHooks?.() ?? []),
+      server.addHook("agent.turn.after", async ({ agent, turnId, outcome }, { paseo }) => {
         if (!isAntigravityProvider(agent.provider)) return;
-        this.cancelRetry(agent.id);
-        if (outcome.kind !== "failed" || this.pending.has(agent.id) || this.pending.isManual(agent.id)) {
-          // A finished or canceled turn ends the chain; the user decides what happens next.
+        const latestTurn = this.latestTurn.get(agent.id);
+        if (turnId && latestTurn && turnId !== latestTurn) return;
+        this.invalidatePreemptive(agent.id);
+        if (turnId) this.latestTurn.set(agent.id, turnId);
+        const failedTurnStale = this.cancellation(agent.id);
+        const failedTurnId = turnId ?? this.latestTurn.get(agent.id) ?? null;
+        const current = this.pending.effectiveAccountId(agent.id, agent.metadata, paseo);
+        if (outcome.kind !== "failed") {
+          // A finished or canceled turn ends the failure chain.
           this.chains.delete(agent.id);
           return;
         }
-        await this.service.init();
-        const settings = this.service.fallbackSettings();
-        if (!settings.enabled) return;
-        try {
-          const snapshot = await paseo.agents
-            .ref(agent.id)
-            .refresh()
-            .catch(() => null);
-          if (this.pending.has(agent.id) || this.pending.isManual(agent.id)) return;
-          const model = snapshot?.agent.model ?? null;
-          const activeAccount =
-            this.pending.sessionAccountOf(agent.id) ??
-            accountIdFromMetadata(snapshot?.agent.metadata ?? agent.metadata);
+        const snapshotAtFailure = paseo.agents.ref(agent.id).refresh().catch(() => null);
+        const processFailure = async (accountId: string, deferred: boolean, historical = false) => {
+          await this.service.init();
+          const settings = this.service.fallbackSettings();
+          if (!settings.enabled || this.disposed || (!deferred && failedTurnStale())) return;
+          const snapshot = await snapshotAtFailure;
+          if (this.disposed || (!deferred && failedTurnStale())) return;
+          const model = snapshot?.agent.model ?? ("model" in agent && typeof agent.model === "string" ? agent.model : null);
+          const metadata = snapshot?.agent.metadata ?? agent.metadata;
+          const queued = pendingSwitchFromMetadata(metadata);
           await this.handleFailure(
             paseo,
             agent.id,
-            activeAccount,
+            accountId,
             model,
             outcome.error,
             settings.retries,
             settings.strategy,
+            queued?.requestId === runtimeAccountFromMetadata(metadata)?.consumedRequestId ? null : queued,
+            snapshot?.agent.model ?? null,
+            failedTurnStale,
+            failedTurnId,
+            deferred,
+            historical,
           );
-        } catch (error) {
+        };
+        const report = (error: unknown) => {
           console.error(`antigravity-accounts: fallback for ${agent.id} failed`, error);
+        };
+        if (
+          this.pending.deferFailure(agent.id, (id, historical) => {
+            void processFailure(id, true, historical).catch(report);
+          })
+        ) {
+          return;
         }
+        await processFailure(current, false).catch(report);
       }),
     ];
     return () => {
       for (const remove of removers) remove();
     };
+  }
+
+  /** Chooses a higher-quota account while creating or opening a session. */
+  async lowQuotaTarget(
+    accountId: string,
+    model?: string | null,
+    excluded: ReadonlySet<string> = new Set(),
+  ): Promise<string | null> {
+    if (!model?.trim()) return null;
+    const deadline = Date.now() + 1500;
+    const order = () => JSON.stringify(orderedAccountIds(this.service.store.readonlyData()));
+    const remaining = (id: string) => this.remainingQuota(id, model);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const settings = this.service.fallbackSettings();
+      const score = remaining(accountId);
+      if (!settings.enabled || settings.preemptiveThreshold <= 0 || score < 0 || score > settings.preemptiveThreshold) {
+        return null;
+      }
+      const orderBefore = order();
+      const next = await this.pickHealthyNext(accountId, new Set([accountId, ...excluded]), model, settings.strategy, {
+        minScore: score + 0.05,
+        requireKnownQuota: true,
+        budgetMs: deadline - Date.now(),
+      });
+      const latest = this.service.fallbackSettings();
+      if (latest.strategy !== settings.strategy || order() !== orderBefore) continue;
+      const current = remaining(accountId);
+      if (
+        !next ||
+        !latest.enabled ||
+        latest.preemptiveThreshold <= 0 ||
+        current < 0 ||
+        current > latest.preemptiveThreshold ||
+        remaining(next) <= current + 0.05 ||
+        !this.isEligible(next, model)
+      ) {
+        return null;
+      }
+      return next;
+    }
+    return null;
+  }
+
+  remainingQuota(accountId: string, model?: string | null) {
+    return poolRemainingScore(this.service.knownQuota(accountId), quotaPoolForModel(model));
+  }
+
+  supportsModel(accountId: string, model?: string | null): boolean {
+    return !model?.trim() || this.models?.supportsModel(accountId, model) !== false;
+  }
+
+  isEligible(accountId: string, model?: string | null): boolean {
+    const account = this.service.store.get(accountId);
+    const enabled =
+      accountId === SYSTEM_ACCOUNT_ID
+        ? this.service.store.readonlyData().systemFallbackEnabled
+        : account?.unsafeDetail === null && account.fallbackEnabled;
+    const pool = quotaPoolForModel(model);
+    const hasModel = Boolean(model && model.trim());
+    return (
+      enabled === true &&
+      this.service.knownStatus(accountId) !== "signed-out" &&
+      !this.activeCooldown(accountId, hasModel ? pool : null) &&
+      (!hasModel || (!exhausted(this.service.knownQuota(accountId), pool) && this.models?.supportsModel(accountId, model) !== false))
+    );
   }
 
   private async handleFailure(
@@ -327,37 +521,66 @@ export class FallbackController {
     error: { message: string; code?: string },
     retries: number,
     strategy: FallbackStrategy,
+    userPending: ReturnType<typeof pendingSwitchFromMetadata>,
+    expectedModel: string | null,
+    failedTurnStale: () => boolean,
+    failedTurnId: string | null,
+    deferred: boolean,
+    historical: boolean,
   ): Promise<void> {
+    const stale = () =>
+      historical || failedTurnStale() || (failedTurnId !== null && this.latestTurn.get(agentId) !== failedTurnId);
     const reason = classify(error.message, error.code);
     const pool = quotaPoolForModel(model);
-    const chain = this.chains.get(agentId) ?? { attempts: 0, tried: new Set<string>() };
-    this.chains.set(agentId, chain);
-    chain.tried.add(current);
     const fromLabel = this.service.labelOf(current);
     const message = error.message.slice(0, 400);
     // The failure may have changed the quota; the sidebar and the next choice should see it.
     await this.service.refreshOne(current).catch(() => undefined);
+    if (this.disposed || (stale() && (!deferred || reason === "transient"))) return;
+    const chain = this.chains.get(agentId) ?? { attempts: 0, tried: new Set<string>() };
+    if (!stale()) {
+      this.chains.set(agentId, chain);
+      chain.tried.add(current);
+    }
 
-    if ((reason === "transient" || reason === "error") && chain.attempts < retries) {
+    if (!stale() && (reason === "transient" || reason === "error") && chain.attempts < retries) {
       chain.attempts += 1;
       const attempt = chain.attempts;
       await this.note(paseo, agentId, { event: "retry", reason, from: fromLabel, to: null, attempt, retries, message });
-      this.scheduleRetry(agentId, attempt * 5000, () => this.resume(paseo, agentId));
+      if (stale()) return;
+      this.scheduleRetry(agentId, attempt * 5000, () => this.resume(paseo, agentId, stale));
       return;
     }
 
-    const cooldownPool: QuotaPool = reason === "auth" ? "all" : pool;
+    const cooldownPool: QuotaPool = reason === "auth" ? "all" : model?.trim() ? pool : "unknown";
     const until =
       reason === "quota"
-        ? (resetOfExhausted(this.service.knownQuota(current), pool) ?? Date.now() + 30 * 60_000)
+        ? ((model?.trim() ? resetOfExhausted(this.service.knownQuota(current), pool) : null) ?? Date.now() + 30 * 60_000)
         : reason === "auth"
           ? Date.now() + 6 * 3_600_000
           : Date.now() + 10 * 60_000;
     this.setCooldown(current, cooldownPool, until, reason);
+    if (stale()) return;
 
     // Keep trying candidates when one fails to open (e.g. an account that lacks the agent's model).
+    let preferred: string | null = null;
+    if (
+      userPending?.source === "user" &&
+      userPending.accountId !== current &&
+      !this.pending.isRequestInvalid(agentId, userPending.requestId)
+    ) {
+      const id = userPending.accountId;
+      if (!(await this.healthOf(id, model)) && (!model?.trim() || this.models?.supportsModel(id, model) !== false)) {
+        preferred = id;
+      } else {
+        chain.tried.add(id);
+        console.warn(`antigravity-accounts: queued account ${id} is unavailable for ${agentId}; trying fallback candidates`);
+      }
+    }
     for (;;) {
-      const next = await this.pickNext(current, chain.tried, model, strategy);
+      const next: string | null = preferred ?? (await this.pickHealthyNext(current, chain.tried, model, strategy));
+      preferred = null;
+      if (stale()) return;
       if (!next) {
         this.chains.delete(agentId);
         await this.note(paseo, agentId, {
@@ -372,57 +595,63 @@ export class FallbackController {
         return;
       }
       chain.tried.add(next);
+      const continueOn = async (obsolete: () => boolean) => {
+        if (obsolete()) return;
+        chain.attempts = 0;
+        await this.note(paseo, agentId, {
+          event: "switch",
+          reason,
+          from: fromLabel,
+          to: this.service.labelOf(next),
+          attempt: 0,
+          retries,
+          message,
+        });
+        if (!obsolete()) await this.resume(paseo, agentId, obsolete);
+      };
+      let own: string | undefined;
       try {
-        await switchAgentAccount(paseo, this.service, this.pending, {
+        const outcome = await switchAgentAccount(paseo, this.service, this.pending, {
           agentId,
           accountId: next,
+          source: "fallback",
           when: "now",
-          skipOpenRedirect: true,
+          expectedFrom: current,
+          expectedModel,
+          shouldAbort: stale,
+          requireNotRunning: true,
+          onReloadStart: (requestId) => {
+            own = requestId;
+            this.onReloadOpen.set(agentId, requestId);
+          },
         });
+        if (stale() || outcome.result !== "switched") return;
       } catch (switchError) {
+        if (stale()) return;
         console.warn(
           `antigravity-accounts: fallback candidate ${next} could not take ${agentId}:`,
           switchError instanceof Error ? switchError.message : String(switchError),
         );
         continue;
+      } finally {
+        if (this.onReloadOpen.get(agentId) === own) this.onReloadOpen.delete(agentId);
       }
-      chain.attempts = 0;
-      await this.note(paseo, agentId, {
-        event: "switch",
-        reason,
-        from: fromLabel,
-        to: this.service.labelOf(next),
-        attempt: 0,
-        retries,
-        message,
-      });
-      await this.resume(paseo, agentId);
+      await continueOn(stale);
       return;
     }
   }
 
   /**
-   * The next account after `current` that can take work for `model`, respecting `fallbackEnabled`,
-   * cooldowns for the model's quota pool, model support, and the configured selection strategy.
+   * Synchronous best-account pick from already-loaded account state (used for UI default preview).
    */
-  async pickNext(
-    current: string,
-    tried: ReadonlySet<string>,
+  pickBestSync(
+    accounts: readonly AccountSummary[],
     model?: string | null,
     strategy: FallbackStrategy = this.service.fallbackSettings().strategy,
-  ): Promise<string | null> {
-    const pool = quotaPoolForModel(model);
-    const state = await this.service.state();
-    const byId = new Map(state.accounts.map((account) => [account.id, account]));
-    const ids = state.accounts.map((account) => account.id);
-    const start = Math.max(0, ids.indexOf(current));
-    const ordered: AccountSummary[] = [];
-    for (let step = 1; step < ids.length; step += 1) {
-      const id = ids[(start + step) % ids.length]!;
-      const account = byId.get(id);
-      if (account) ordered.push(account);
-    }
-
+  ): string | null {
+    const hasModel = Boolean(model && model.trim());
+    const pool = hasModel ? quotaPoolForModel(model) : null;
+    const now = Date.now();
     const candidates: Array<{
       id: string;
       orderIndex: number;
@@ -430,42 +659,151 @@ export class FallbackController {
       weightedScore: number;
       soonestReset: number;
     }> = [];
-    for (let index = 0; index < ordered.length; index += 1) {
-      const account = ordered[index]!;
-      const id = account.id;
-      if (tried.has(id)) continue;
-      if (!account.fallbackEnabled) continue;
-      if (this.activeCooldown(id, pool)) continue;
-      if (!account.usable || account.status === "signed-out") continue;
-      if (this.models?.supportsModel(id, model) === false) continue;
-      let refreshed = false;
-      if (account.status === "unknown" || hasExpiredReset(this.service.knownQuota(id))) {
-        // Never checked or past a quota reset window: refresh once before evaluating.
-        await this.service.refreshOne(id).catch(() => undefined);
-        refreshed = true;
+    for (let index = 0; index < accounts.length; index += 1) {
+      const account = accounts[index]!;
+      if (!account.usable || !account.fallbackEnabled || account.status === "signed-out") continue;
+      if (this.activeCooldown(account.id, pool)) continue;
+      if (pool && (this.models?.supportsModel(account.id, model) === false || exhausted(account.quota, pool, now))) {
+        continue;
       }
-      const known = this.service.knownQuota(id);
-      if (exhausted(known, pool)) continue;
-      if (refreshed) {
-        const fresh = (await this.service.state()).accounts.find((entry) => entry.id === id);
-        if (!fresh || fresh.status === "signed-out" || !fresh.usable || !fresh.fallbackEnabled) continue;
-      }
-      if (id !== SYSTEM_ACCOUNT_ID && !(await this.service.hasSignInFile(id))) continue;
-      const supported = this.models?.ensureModelSupport
-        ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
-        : (this.models?.supportsModel(id, model) ?? null);
-      if (supported === false) continue;
-      const metrics = evaluatePoolQuota(known, pool);
       candidates.push({
-        id,
+        id: account.id,
         orderIndex: index,
-        score: poolRemainingScore(known, pool),
-        weightedScore: computeEffectiveWeight({
-          baseWeight: account.effectiveWeight > 0 ? account.effectiveWeight : 0.01,
-          metrics,
-        }),
-        soonestReset: poolSoonestReset(known, pool),
+        score: poolRemainingScore(account.quota, pool, now),
+        weightedScore: weightedPoolScore(account.quota, account.effectiveWeight, pool, now),
+        soonestReset: poolSoonestReset(account.quota, pool, now),
       });
+    }
+    if (!candidates.length) return null;
+    if (strategy === "quota") {
+      candidates.sort((a, b) => b.score - a.score || a.orderIndex - b.orderIndex);
+    } else if (strategy === "weighted") {
+      candidates.sort((a, b) => b.weightedScore - a.weightedScore || b.score - a.score || a.orderIndex - b.orderIndex);
+    } else if (strategy === "reset") {
+      candidates.sort((a, b) => a.soonestReset - b.soonestReset || b.score - a.score || a.orderIndex - b.orderIndex);
+    }
+    return candidates[0]!.id;
+  }
+
+  /**
+   * Picks the best eligible account from an ordered list using shared eligibility rules,
+   * short bounded probes for unknown profiles (never risking hook timeouts), and optional score bounds.
+   */
+  private async selectFromOrdered(
+    ordered: readonly AccountSummary[],
+    tried: ReadonlySet<string>,
+    model: string | null | undefined,
+    strategy: FallbackStrategy,
+    options?: { minScore?: number; requireKnownQuota?: boolean; budgetMs?: number },
+    initialRevision?: number,
+  ): Promise<string | null> {
+    const hasModel = Boolean(model && model.trim());
+    const pool = hasModel ? quotaPoolForModel(model) : null;
+    const minScore = options?.minScore;
+    const requireKnownQuota = options?.requireKnownQuota === true;
+    const deadline = Date.now() + (options?.budgetMs ?? 8000);
+    let lastAccounts = ordered;
+    let lastRevision = initialRevision;
+    const freshAccounts = async () => {
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        const fresh = await awaitWithin(this.service.state(), remaining);
+        if (fresh) {
+          lastAccounts = fresh.accounts;
+          lastRevision = fresh.revision;
+          return lastAccounts;
+        }
+      }
+      // At the deadline, reuse a still-current snapshot without starting more I/O.
+      if (lastRevision !== undefined && this.service.currentRevision() === lastRevision) return lastAccounts;
+      return null;
+    };
+    const probe = async (accountId: string, remaining: number) => {
+      const timeoutMs = Math.min(5000, remaining);
+      const request = this.service.refreshOne(accountId, { skipPlan: true, timeoutMs });
+      await awaitWithin(request, timeoutMs).catch(() => undefined);
+    };
+
+    const eligibleBeforeProbe = ordered.filter((account) => {
+      if (tried.has(account.id)) return false;
+      if (!account.fallbackEnabled || !account.usable || account.status === "signed-out") return false;
+      if (this.activeCooldown(account.id, pool)) return false;
+      if (hasModel && this.models?.supportsModel(account.id, model) === false) return false;
+      return true;
+    });
+    if (!eligibleBeforeProbe.length) return null;
+
+    const evaluate = (account: AccountSummary, orderIndex: number, now: number) => {
+      if (!account.fallbackEnabled || !account.usable || account.status === "signed-out") return null;
+      if (this.activeCooldown(account.id, pool)) return null;
+      if (hasModel && this.models?.supportsModel(account.id, model) === false) return null;
+      const known = this.service.knownQuota(account.id);
+      if (pool && exhausted(known, pool, now)) return null;
+      const score = poolRemainingScore(known, pool, now);
+      if (requireKnownQuota && score < 0) return null;
+      if (minScore !== undefined && (score < 0 || score <= minScore)) return null;
+      return {
+        id: account.id,
+        orderIndex,
+        score,
+        weightedScore: weightedPoolScore(known, account.effectiveWeight, pool, now),
+        soonestReset: poolSoonestReset(known, pool, now),
+      };
+    };
+
+    // Priority order can short-circuit as soon as the first eligible candidate checks out.
+    if (strategy === "order") {
+      for (let index = 0; index < eligibleBeforeProbe.length; index += 1) {
+        const account = eligibleBeforeProbe[index]!;
+        const needsProbe = account.status === "unknown" && (account.id !== SYSTEM_ACCOUNT_ID || requireKnownQuota);
+        if (needsProbe) {
+          const remaining = deadline - Date.now();
+          if (remaining > 0) await probe(account.id, remaining);
+        }
+        const accounts = await freshAccounts();
+        if (!accounts) return null;
+        const fresh = accounts.find((entry) => entry.id === account.id);
+        if (!fresh) continue;
+        const picked = evaluate(fresh, index, Date.now());
+        if (picked) return picked.id;
+      }
+      return null;
+    }
+
+    // For quota/weighted/reset strategies, probe unknown profiles with bounded concurrency and shared time budget.
+    const toProbe = eligibleBeforeProbe.filter(
+      (account) => account.status === "unknown" && (account.id !== SYSTEM_ACCOUNT_ID || requireKnownQuota),
+    );
+    if (toProbe.length > 0) {
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < toProbe.length) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          const next = toProbe[cursor++]!;
+          await probe(next.id, remaining);
+        }
+      };
+      const concurrency = Math.min(3, toProbe.length);
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    }
+
+    const accounts = await freshAccounts();
+    if (!accounts) return null;
+    const now = Date.now();
+    const freshById = new Map(accounts.map((entry) => [entry.id, entry]));
+    const candidates: Array<{
+      id: string;
+      orderIndex: number;
+      score: number;
+      weightedScore: number;
+      soonestReset: number;
+    }> = [];
+    for (let index = 0; index < eligibleBeforeProbe.length; index += 1) {
+      const fresh = freshById.get(eligibleBeforeProbe[index]!.id);
+      if (!fresh) continue;
+      const evaluated = evaluate(fresh, index, now);
+      if (evaluated) candidates.push(evaluated);
     }
 
     if (!candidates.length) return null;
@@ -480,72 +818,138 @@ export class FallbackController {
   }
 
   /**
+   * Picks the best eligible account across all accounts for a new agent (Auto routing mode).
+   */
+  async pickBest(
+    model?: string | null,
+    strategy: FallbackStrategy = this.service.fallbackSettings().strategy,
+    options?: { budgetMs?: number; tried?: ReadonlySet<string> },
+  ): Promise<string | null> {
+    const budget = options?.budgetMs ?? 8000;
+    const deadline = Date.now() + budget;
+    const state = await awaitWithin(this.service.state(), budget);
+    if (!state) return null;
+    return this.selectFromOrdered(
+      state.accounts,
+      options?.tried ?? new Set(),
+      model,
+      strategy,
+      { budgetMs: Math.max(0, deadline - Date.now()) },
+      state.revision,
+    );
+  }
+
+  /**
+   * The next account after `current` that can take work for `model`, respecting `fallbackEnabled`,
+   * cooldowns for the model's quota pool, model support, and the configured selection strategy.
+   */
+  async pickNext(
+    current: string,
+    tried: ReadonlySet<string>,
+    model?: string | null,
+    strategy: FallbackStrategy = this.service.fallbackSettings().strategy,
+    options?: { minScore?: number; requireKnownQuota?: boolean; budgetMs?: number },
+  ): Promise<string | null> {
+    const budget = options?.budgetMs ?? 8000;
+    const deadline = Date.now() + budget;
+    const state = await awaitWithin(this.service.state(), budget);
+    if (!state) return null;
+    const index = state.accounts.findIndex((account) => account.id === current);
+    const ordered = index < 0 ? state.accounts : [...state.accounts.slice(index + 1), ...state.accounts.slice(0, index)];
+    return this.selectFromOrdered(
+      ordered,
+      tried,
+      model,
+      strategy,
+      { ...options, budgetMs: Math.max(0, deadline - Date.now()) },
+      state.revision,
+    );
+  }
+
+  private async pickHealthy(
+    model: string | null | undefined,
+    tried: ReadonlySet<string>,
+    budgetMs: number,
+    pick: (rejected: ReadonlySet<string>, remaining: number) => Promise<string | null>,
+  ): Promise<string | null> {
+    const deadline = Date.now() + budgetMs;
+    const rejected = new Set(tried);
+    while (Date.now() < deadline) {
+      const id = await pick(rejected, deadline - Date.now());
+      if (!id || rejected.has(id) || Date.now() >= deadline) break;
+      rejected.add(id);
+      try {
+        this.service.assertAccountOpenable(id);
+      } catch {
+        continue;
+      }
+      const reason = await awaitWithin(this.healthOf(id, model), deadline - Date.now());
+      if (reason === null && this.isEligible(id, model)) return id;
+    }
+    return null;
+  }
+
+  pickHealthyBest(model?: string | null, tried: ReadonlySet<string> = new Set(), options?: { budgetMs?: number }) {
+    return this.pickHealthy(model, tried, options?.budgetMs ?? 8000, (rejected, budgetMs) =>
+      this.pickBest(model, undefined, { tried: rejected, budgetMs }),
+    );
+  }
+
+  pickHealthyNext(
+    current: string,
+    tried: ReadonlySet<string>,
+    model?: string | null,
+    strategy?: FallbackStrategy,
+    options?: { minScore?: number; requireKnownQuota?: boolean; budgetMs?: number },
+  ) {
+    return this.pickHealthy(model, tried, options?.budgetMs ?? 8000, (rejected, budgetMs) =>
+      this.pickNext(current, rejected, model, strategy, { ...options, budgetMs }),
+    );
+  }
+
+  /**
    * Why an account cannot take a session right now, or null. Uses only what is already known:
-   * a missing sign-in file, a signed-out or unsafe account, an unsupported model, an exhausted quota, or a cooldown.
+   * a missing sign-in file, a signed-out or unsafe account, an exhausted quota, or a cooldown.
    */
   async healthOf(accountId: string, model?: string | null): Promise<FailureKind | null> {
-    const pool = quotaPoolForModel(model);
+    const pool = model?.trim() ? quotaPoolForModel(model) : null;
     const cooling = this.activeCooldown(accountId, pool);
     if (cooling) return cooling.reason;
     const state = await this.service.state();
     const account = state.accounts.find((entry) => entry.id === accountId);
     if (!account || !account.usable || account.status === "signed-out") return "auth";
     if (account.kind === "profile" && !(await this.service.hasSignInFile(accountId))) return "auth";
-    if (this.models?.supportsModel(accountId, model) === false) return "error";
-    if (exhausted(this.service.knownQuota(accountId), pool)) return "quota";
+    if (pool && exhausted(this.service.knownQuota(accountId), pool)) return "quota";
     return null;
   }
 
-  /**
-   * Called while an agent's session opens on an account that cannot take it. Returns the account to
-   * open on instead and, once the open is over, records the change on the agent and in its timeline.
-   */
-  async redirectForOpen(
-    paseo: PaseoApi,
-    agentId: string,
-    accountId: string,
-    reason: FailureKind,
-    record: boolean,
-    model?: string | null,
-  ): Promise<string | null> {
-    const next = await this.pickNext(accountId, new Set([accountId]), model);
-    if (!next || !record) return next;
-    const from = this.service.labelOf(accountId);
-    const to = this.service.labelOf(next);
-    // The open waits for this hook; touching the agent before it returns could deadlock.
-    this.laterRedirect(1500, async () => {
-      const handle = paseo.agents.ref(agentId);
-      const snapshot = await handle.refresh().catch(() => null);
-      if (!snapshot || snapshot.agent.archivedAt) return;
-      // Only commit the redirect if the user did not manually switch the agent meanwhile.
-      if (accountIdFromMetadata(snapshot.agent.metadata) !== accountId) return;
-      await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: next });
-      await this.note(paseo, agentId, {
-        event: "switch",
-        reason,
-        from,
-        to,
-        attempt: 0,
-        retries: this.service.fallbackSettings().retries,
-        message: "",
-      });
+  noteOpen(paseo: PaseoApi, agentId: string, from: string, to: string, reason: FailureKind) {
+    return this.note(paseo, agentId, {
+      event: "switch",
+      reason,
+      from: this.service.labelOf(from),
+      to: this.service.labelOf(to),
+      attempt: 0,
+      retries: this.service.fallbackSettings().retries,
+      message: "",
     });
-    return next;
   }
 
   /** Sends the resume prompt unless the agent is already busy, archived, or fallback was turned off. */
-  private async resume(paseo: PaseoApi, agentId: string): Promise<void> {
+  private async resume(paseo: PaseoApi, agentId: string, stale: () => boolean): Promise<void> {
+    if (stale()) return;
     if (!this.service.fallbackSettings().enabled) {
       this.chains.delete(agentId);
       return;
     }
     const handle = paseo.agents.ref(agentId);
     const snapshot = await handle.refresh().catch(() => null);
+    if (stale()) return;
     if (!snapshot || snapshot.agent.archivedAt) {
       this.chains.delete(agentId);
       return;
     }
-    if (snapshot.agent.status === "running" || snapshot.agent.status === "initializing") return;
+    if (snapshot.agent.activeTurn || snapshot.agent.status === "running" || snapshot.agent.status === "initializing") return;
     await handle.send(RESUME_PROMPT);
   }
 
@@ -571,19 +975,13 @@ export class FallbackController {
     this.retryTimers.set(agentId, timer);
   }
 
-  private laterRedirect(ms: number, task: () => Promise<void>): void {
-    const timer = setTimeout(() => {
-      this.redirectTimers.delete(timer);
-      void task().catch((error: unknown) => console.error("antigravity-accounts: redirect record failed", error));
-    }, ms);
-    this.redirectTimers.add(timer);
-  }
-
   dispose(): void {
+    this.disposed = true;
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
-    for (const timer of this.redirectTimers) clearTimeout(timer);
-    this.redirectTimers.clear();
+    this.turnGen.clear();
+    this.latestTurn.clear();
+    this.onReloadOpen.clear();
     this.chains.clear();
   }
 }

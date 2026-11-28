@@ -1,5 +1,7 @@
 import {
   SYSTEM_ACCOUNT_ID,
+  accountSupportsModel,
+  isAutoAccountId,
   quotaPoolForModel,
   type AccountSummary,
   type QuotaGroup,
@@ -20,6 +22,8 @@ const DISPATCH_RETENTION_MS = 15 * 60_000;
 const URGENCY_WINDOW_MS = 24 * 3_600_000;
 const URGENCY_MIN_REMAINING = 0.4;
 const URGENCY_MAX_BOOST = 0.25;
+
+export { isAutoAccountId };
 
 export interface PoolQuotaMetrics {
   /** Blended remaining fraction (0..1) combining 5h and weekly windows. */
@@ -115,14 +119,20 @@ export interface RoutingCandidate {
   minRemaining: number | null;
 }
 
-/** Filters candidates to those above `reserveFraction` when at least one qualifies. */
+/**
+ * Filters candidates to those strictly above `max(reservePercent / 100, preemptiveThreshold)` when
+ * at least one healthier weighted account qualifies.
+ */
 export function applyReserveFloor(
   candidates: readonly RoutingCandidate[],
   reservePercent: number,
+  preemptiveThreshold = 0,
 ): RoutingCandidate[] {
   const positive = candidates.filter((candidate) => candidate.effectiveWeight > 0);
   if (positive.length === 0) return [];
-  const floor = Math.max(0, Math.min(50, reservePercent)) / 100;
+  const reserveFloor = Math.max(0, Math.min(50, reservePercent)) / 100;
+  const preemptiveFloor = Math.max(0, Math.min(0.5, preemptiveThreshold));
+  const floor = Math.max(reserveFloor, preemptiveFloor);
   if (floor <= 0) return positive;
   const healthy = positive.filter(
     (candidate) => candidate.minRemaining === null || candidate.minRemaining > floor,
@@ -197,12 +207,17 @@ export function pickCapacityFirst(candidates: readonly RoutingCandidate[]): Rout
 
 /** Computes normalized routing shares (0..1) for display on account cards. */
 export function computeRoutingShares(
-  accounts: readonly Pick<AccountSummary, "id" | "usable" | "status" | "quota" | "effectiveWeight" | "cooldowns">[],
+  accounts: readonly Pick<
+    AccountSummary,
+    "id" | "usable" | "status" | "quota" | "effectiveWeight" | "cooldowns" | "supportedModels"
+  >[],
   mode: RoutingMode,
   reservePercent: number,
   pool: "gemini" | "third-party" = "gemini",
   runningCounts?: ReadonlyMap<string, number>,
   now = Date.now(),
+  preemptiveThreshold = 0,
+  model?: string | null,
 ): Map<string, number> {
   const shares = new Map<string, number>();
   if (mode === "default") return shares;
@@ -212,6 +227,7 @@ export function computeRoutingShares(
     const account = accounts[index]!;
     if (!account.usable || account.status === "signed-out") continue;
     if (account.effectiveWeight <= 0) continue;
+    if (model && accountSupportsModel(account, model) === false) continue;
     const cooling = account.cooldowns.some(
       (entry) => (entry.pool === "all" || entry.pool === pool) && Date.parse(entry.until) > now,
     );
@@ -233,7 +249,7 @@ export function computeRoutingShares(
     });
   }
 
-  const eligible = applyReserveFloor(candidates, reservePercent);
+  const eligible = applyReserveFloor(candidates, reservePercent, preemptiveThreshold);
   if (eligible.length === 0) return shares;
 
   if (mode === "capacity") {
@@ -254,7 +270,17 @@ export function computeRoutingShares(
 }
 
 export interface CooldownChecker {
-  isCooling(accountId: string, pool: "gemini" | "third-party"): boolean;
+  isCooling(accountId: string, pool: "gemini" | "third-party" | null): boolean;
+}
+
+export interface PickForNewAgentOptions {
+  /** Accounts to exclude from this pick (e.g. recently failed launch targets). */
+  excluded?: ReadonlySet<string>;
+  /**
+   * When true, allow weighted load-balanced selection even when `routing.mode === "default"`
+   * (used when `defaultAccountId === "auto"` or draft metadata requests auto-routing).
+   */
+  forceAuto?: boolean;
 }
 
 /**
@@ -291,43 +317,58 @@ export class AccountRouter {
   }
 
   /** Serializes concurrent `agent.create.before` picks so parallel spawns spread atomically. */
-  pickForNewAgent(model?: string | null): Promise<string | null> {
-    const task = this.queue.catch(() => undefined).then(() => this.selectAccount(model));
+  pickForNewAgent(model?: string | null, options?: PickForNewAgentOptions): Promise<string | null> {
+    const task = this.queue.catch(() => undefined).then(() => this.selectAccount(model, options));
     this.queue = task;
     return task;
   }
 
-  private async selectAccount(model?: string | null): Promise<string | null> {
+  private async selectAccount(model?: string | null, options?: PickForNewAgentOptions): Promise<string | null> {
     const routing = this.service.routingSettings();
-    if (routing.mode === "default") return null;
+    const effectiveMode: RoutingMode =
+      routing.mode !== "default" ? routing.mode : options?.forceAuto ? "balanced" : "default";
+    if (effectiveMode === "default") return null;
 
+    const fallback = this.service.fallbackSettings();
+    const hasModel = Boolean(model && model.trim());
     const pool = quotaPoolForModel(model);
     const state = await this.service.state();
     const now = Date.now();
+    const excluded = options?.excluded;
     const candidates: RoutingCandidate[] = [];
 
     for (let index = 0; index < state.accounts.length; index += 1) {
       const account = state.accounts[index]!;
       const id = account.id;
+      if (excluded?.has(id)) continue;
       if (!account.usable || account.status === "signed-out") continue;
+      if (routing.mode === "default" && !account.fallbackEnabled) continue;
       if (account.effectiveWeight <= 0) continue;
-      if (this.cooldowns.isCooling(id, pool)) continue;
-      if (this.models?.supportsModel(id, model) === false) continue;
+      try {
+        this.service.assertAccountOpenable(id);
+      } catch {
+        continue;
+      }
+      if (this.cooldowns.isCooling(id, hasModel ? pool : null)) continue;
+      if (hasModel && accountSupportsModel(account, model) === false) continue;
+      if (hasModel && this.models?.supportsModel(id, model) === false) continue;
 
       let quota = this.service.knownQuota(id);
       if (account.status === "unknown") {
-        await this.service.refreshOne(id).catch(() => undefined);
+        await this.service.refreshOne(id, { skipPlan: true, timeoutMs: 4000 }).catch(() => undefined);
         quota = this.service.knownQuota(id);
         const freshStatus = this.service.knownStatus(id);
         if (freshStatus === "signed-out") continue;
       }
-      if (exhausted(quota, pool, now)) continue;
+      if (hasModel && exhausted(quota, pool, now)) continue;
       if (id !== SYSTEM_ACCOUNT_ID && !(await this.service.hasSignInFile(id))) continue;
 
-      const supported = this.models?.ensureModelSupport
-        ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
-        : (this.models?.supportsModel(id, model) ?? null);
-      if (supported === false) continue;
+      if (hasModel) {
+        const supported = this.models?.ensureModelSupport
+          ? await this.models.ensureModelSupport(id, model).catch(() => this.models?.supportsModel(id, model) ?? null)
+          : (this.models?.supportsModel(id, model) ?? null);
+        if (supported === false) continue;
+      }
 
       const metrics = evaluatePoolQuota(quota, pool, now);
       const effectiveWeight = computeEffectiveWeight({
@@ -347,11 +388,11 @@ export class AccountRouter {
       });
     }
 
-    const eligible = applyReserveFloor(candidates, routing.reservePercent);
+    const eligible = applyReserveFloor(candidates, routing.reservePercent, fallback.preemptiveThreshold);
     if (eligible.length === 0) return null;
 
     const picked =
-      routing.mode === "capacity"
+      effectiveMode === "capacity"
         ? pickCapacityFirst(eligible)
         : pickSmoothWeighted(eligible, this.swrrByPool[pool]);
     if (!picked) return null;

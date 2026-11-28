@@ -4,6 +4,7 @@ import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   SYSTEM_ACCOUNT_ID,
+  accountSupportsModel,
   isAntigravityProvider,
   type ModelFamily,
   type OrchestratorChoice,
@@ -161,7 +162,9 @@ export class OrchestratorSettings {
   private writing: Promise<unknown> = Promise.resolve();
   private writeSeq = 0;
 
-  constructor(private readonly service: AccountService) {}
+  constructor(private readonly service: AccountService) {
+    this.service.setModelProvider((accountId) => this.cachedModelIds(accountId));
+  }
 
   invalidateAccount(accountId: string): void {
     this.catalogs.delete(accountId);
@@ -176,28 +179,26 @@ export class OrchestratorSettings {
     return email ?? "";
   }
 
+  /** Cached agy model IDs and display labels for `accountId`, or null when not fetched yet. */
+  cachedModelIds(accountId: string): string[] | null {
+    const cached = this.catalogs.get(accountId);
+    if (!cached) return null;
+    const identity = this.currentIdentity(accountId);
+    if (identity && cached.identity && cached.identity !== identity) return null;
+    return [...new Set(cached.models.flatMap(({ id, label }) => [id, label]))];
+  }
+
   /**
    * Whether `accountId` is known to support `model`. Returns `null` when the account's model
    * catalog has not been fetched yet (or belongs to another sign-in) so callers do not falsely block it.
    */
   supportsModel(accountId: string, model: string | null | undefined): boolean | null {
-    if (!model) return null;
-    const cached = this.catalogs.get(accountId);
-    if (!cached) return null;
-    const identity = this.currentIdentity(accountId);
-    if (identity && cached.identity && cached.identity !== identity) return null;
-    const normalized = model.trim().toLowerCase().replace(/^antigravity\//, "");
-    const family = normalized.replace(EFFORT_SUFFIX, "");
-    return cached.models.some((entry) => {
-      const id = entry.id.toLowerCase();
-      const label = entry.label.toLowerCase();
-      return id === normalized || label === normalized || id.replace(EFFORT_SUFFIX, "") === family;
-    });
+    return accountSupportsModel({ supportedModels: this.cachedModelIds(accountId) }, model);
   }
 
   /**
    * Like `supportsModel`, but lazily fetches `agy models` (honoring cache & failure backoff) when
-   * the account's catalog is missing or stale, so fallback checks real model availability.
+   * the account's catalog is missing or stale, so routing and fallback check real model availability.
    */
   async ensureModelSupport(accountId: string, model: string | null | undefined): Promise<boolean | null> {
     if (!model) return null;
@@ -238,7 +239,10 @@ export class OrchestratorSettings {
         return usable?.models ?? null;
       }
       this.failures.delete(accountId);
+      const prevIds = usable?.models.map((entry) => entry.id).join("\n") ?? "";
+      const nextIds = models.map((entry) => entry.id).join("\n");
       this.catalogs.set(accountId, { models, fetchedAt: Date.now(), identity });
+      if (prevIds !== nextIds) this.service.notifyChange();
       return models;
     })().finally(() => {
       if (this.fetching.get(accountId) === task) this.fetching.delete(accountId);
@@ -303,6 +307,8 @@ export class OrchestratorSettings {
     accountId?: string;
     inheritGlobal?: boolean;
   }): Promise<OrchestratorState> {
+    await this.service.store.load();
+    this.service.store.assertWritable();
     const state = await this.state();
     const known = (families: readonly ModelFamily[], label: string) =>
       families.some((family) => family.variants.some((variant) => variant.label === label));
@@ -312,10 +318,7 @@ export class OrchestratorSettings {
     if (update.executor && !known(state.executors, update.executor)) {
       throw new Error(`${update.executor} is not an executor model your accounts can use.`);
     }
-    if (update.accountId === SYSTEM_ACCOUNT_ID) {
-      throw new Error("The system account uses the global Orchestrator setting.");
-    }
-    if (update.accountId) {
+    if (update.accountId && update.accountId !== SYSTEM_ACCOUNT_ID) {
       if (update.inheritGlobal) {
         await this.service.setAccountOptions(update.accountId, { orchestratorOverride: null });
         return this.state();
@@ -382,8 +385,8 @@ export class OrchestratorSettings {
 
   register(server: PluginServerContext): Array<() => void> {
     return [
-      this.service.onStatusUpdated(({ accountId, signedInChanged, emailChanged }) => {
-        if (signedInChanged || emailChanged) this.invalidateAccount(accountId);
+      this.service.onStatusUpdated(({ accountId, signedInChanged, emailChanged, identityChanged }) => {
+        if (signedInChanged || emailChanged || identityChanged) this.invalidateAccount(accountId);
       }),
       server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
         if (!this.pendingReloads.has(agent.id)) return;

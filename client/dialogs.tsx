@@ -90,6 +90,93 @@ export function NameDialog({
   );
 }
 
+/** Modal to set or clear a short note/tag on any account (system or profile). */
+export function NoteDialog({
+  colors,
+  accountLabel,
+  initial,
+  onSubmit,
+  onClose,
+}: {
+  colors: Colors;
+  accountLabel: string;
+  initial: string;
+  onSubmit(note: string | null): Promise<void>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation(messages);
+  const [note, setNote] = useState(initial);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const changed = note.trim() !== initial.trim();
+
+  async function save(next: string | null) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await onSubmit(next && next.trim().length > 0 ? next.trim() : null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open title={t("dialog.noteTitle", { label: accountLabel })} onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
+      <Modal.Content>
+        <Muted colors={colors}>{t("dialog.noteHint")}</Muted>
+        <View style={{ gap: space.xs + 2 }}>
+          <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>{t("dialog.noteLabel")}</Text>
+          <TextInput
+            accessibilityLabel={t("dialog.noteLabel")}
+            autoFocus
+            maxLength={80}
+            value={note}
+            editable={!busy}
+            onChangeText={setNote}
+            onSubmitEditing={() => void save(note)}
+            placeholder={t("dialog.notePlaceholder")}
+            placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+            style={{
+              ...font.body,
+              color: colors.foreground,
+              backgroundColor: colors.surface0,
+              borderColor: colors.border,
+              borderWidth: 1,
+              borderRadius: radius.md,
+              paddingHorizontal: space.md,
+              paddingVertical: space.sm + 2,
+            }}
+          />
+        </View>
+        {error ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={error} /> : null}
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
+          {initial.trim().length > 0 ? (
+            <Button
+              colors={colors}
+              variant="ghost"
+              label={t("dialog.noteClear")}
+              disabled={busy}
+              onPress={() => void save(null)}
+            />
+          ) : null}
+          <View style={{ flex: 1 }} />
+          <Button colors={colors} variant="ghost" label={t("dialog.cancel")} disabled={busy} onPress={onClose} />
+          <Button
+            colors={colors}
+            variant="primary"
+            label={t("dialog.save")}
+            loading={busy}
+            disabled={!changed}
+            onPress={() => void save(note)}
+          />
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
 /** Names shown in the Remove / Recover dialog before "and N more". */
 const SHOWN_FILES = 6;
 
@@ -441,7 +528,7 @@ export function AccountAgentsDialog({
                     const name = displayLabel(entry.label, t, entry.kind);
                     return {
                       value: entry.id,
-                      label: [name, shortPlan(entry.plan, name)].filter(Boolean).join(" · "),
+                      label: [name, entry.note, shortPlan(entry.plan, name)].filter(Boolean).join(" · "),
                     };
                   })}
                   onValueChange={setTargetId}
