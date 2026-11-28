@@ -310,11 +310,11 @@ export const fallbackSettingsSchema = z.object({
 export type FallbackSettings = z.infer<typeof fallbackSettingsSchema>;
 
 /** How new Antigravity agents choose an account when none is explicitly selected. */
-export const routingModeSchema = z.enum(["default", "balanced", "capacity"]);
+export const routingModeSchema = z.enum(["default", "balanced", "ratio", "capacity"]);
 export type RoutingMode = z.infer<typeof routingModeSchema>;
 
 export const routingSettingsSchema = z.object({
-  /** default: always defaultAccountId; balanced: dynamic weighted SWRR; capacity: highest effective weighted quota. */
+  /** default: always defaultAccountId; balanced: dynamic weighted SWRR; ratio: strict custom ratio SWRR; capacity: highest effective weighted quota. */
   mode: routingModeSchema,
   /** Prefer accounts with remaining quota above this percentage (0..50) before dipping into low-quota accounts. */
   reservePercent: z.number().int().min(0).max(50),
@@ -770,6 +770,28 @@ export const setFallbackRpc = defineRpc({
 export const setRoutingRpc = defineRpc({
   name: "accounts.set-routing",
   input: routingSettingsSchema.partial().strict(),
+  output: accountsStateSchema,
+});
+
+/** Atomically updates custom load-balancing weights across multiple accounts (and optionally the routing mode). */
+export const setRoutingWeightsRpc = defineRpc({
+  name: "accounts.set-routing-weights",
+  input: z
+    .object({
+      entries: z
+        .array(
+          z
+            .object({
+              accountId: accountIdSchema,
+              /** Custom weight (0 excludes from auto-routing; null restores plan-inferred default). */
+              weight: accountWeightSchema.nullable(),
+            })
+            .strict(),
+        )
+        .min(1),
+      mode: routingModeSchema.optional(),
+    })
+    .strict(),
   output: accountsStateSchema,
 });
 

@@ -764,6 +764,32 @@ export class AccountService {
     this.changed();
   }
 
+  /** Atomically updates load-balancing weights across multiple accounts and optionally switches routing mode. */
+  async setRoutingWeights(
+    entries: readonly { accountId: string; weight: number | null }[],
+    mode?: RoutingSettings["mode"],
+  ): Promise<void> {
+    await this.store.load();
+    this.store.assertWritable();
+    for (const entry of entries) {
+      this.requireAccount(entry.accountId);
+    }
+    await this.store.update((data) => {
+      for (const { accountId, weight } of entries) {
+        if (accountId === SYSTEM_ACCOUNT_ID) {
+          data.systemWeight = weight;
+          continue;
+        }
+        const account = data.accounts.find((candidate) => candidate.id === accountId);
+        if (account) account.weight = weight;
+      }
+      if (mode !== undefined) {
+        data.routing = { ...data.routing, mode };
+      }
+    });
+    this.changed();
+  }
+
   /** A profile must have its own real OAuth credential before it can be used. */
   async hasSignInFile(accountId: string): Promise<boolean> {
     return (await profileSignInFingerprint(accountId)) !== null;

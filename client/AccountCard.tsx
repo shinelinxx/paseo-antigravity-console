@@ -19,6 +19,7 @@ export type CardAction =
   | "moveDown"
   | "toggleFallback"
   | "setWeight"
+  | "editRatios"
   | "clearCooldown"
   | "orchestratorOverride"
   | "recoverFiles"
@@ -322,22 +323,27 @@ export const AccountCard = memo(function AccountCard({
           <Badge colors={colors} label={t(`kind.${account.kind}`)} icon={isProfile ? "UserRound" : "KeyRound"} />
           {!account.fallbackEnabled ? <Badge colors={colors} label={t("badgeNoFallback")} icon="ShieldOff" /> : null}
           {routingMode !== "default" || account.weight !== null ? (
-            <Pressable accessibilityRole="button" onPress={() => onAction("setWeight")}>
+            <Pressable accessibilityRole="button" onPress={() => onAction("editRatios")}>
               <Badge
                 colors={colors}
                 label={
                   account.effectiveWeight <= 0
                     ? t("badgeWeightOff")
-                    : account.routingShare !== null && routingMode !== "default"
-                      ? t("badgeWeightWithShare", {
+                    : account.routingShare !== null && routingMode === "ratio"
+                      ? t("badgeRatioWithShare", {
                           weight: formatWeight(account.effectiveWeight),
                           share: percent(account.routingShare, locale),
                         })
-                      : account.weight === null
-                        ? t("badgeWeightAuto", { weight: formatWeight(account.effectiveWeight) })
-                        : t("badgeWeightCustom", { weight: formatWeight(account.effectiveWeight) })
+                      : account.routingShare !== null && routingMode !== "default"
+                        ? t("badgeWeightWithShare", {
+                            weight: formatWeight(account.effectiveWeight),
+                            share: percent(account.routingShare, locale),
+                          })
+                        : account.weight === null
+                          ? t("badgeWeightAuto", { weight: formatWeight(account.effectiveWeight) })
+                          : t("badgeWeightCustom", { weight: formatWeight(account.effectiveWeight) })
                 }
-                tone={account.effectiveWeight <= 0 ? "neutral" : account.weight !== null ? "accent" : "neutral"}
+                tone={account.effectiveWeight <= 0 ? "neutral" : account.weight !== null || routingMode === "ratio" ? "accent" : "neutral"}
                 icon="Gauge"
               />
             </Pressable>

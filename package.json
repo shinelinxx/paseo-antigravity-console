@@ -1,7 +1,7 @@
 {
   "name": "paseo-antigravity-console",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Multiple Google accounts with automatic fallback, quota, usage and cost estimates, subagent views, interactive question cards, and Orchestrator model choices for Paseo's built-in Antigravity provider.",
   "license": "MIT",
   "repository": {

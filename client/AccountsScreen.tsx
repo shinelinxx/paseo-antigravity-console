@@ -14,6 +14,7 @@ import {
   setDefaultAccountRpc,
   setFallbackRpc,
   setRoutingRpc,
+  setRoutingWeightsRpc,
   signOutAccountRpc,
   type AccountSummary,
   type DefaultAccountId,
@@ -23,7 +24,7 @@ import {
 } from "../shared/contracts";
 import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
-import { AccountAgentsDialog, ConfirmRemove, NameDialog, NoteDialog, RecoverFilesDialog, WeightDialog } from "./dialogs";
+import { AccountAgentsDialog, ConfirmRemove, NameDialog, NoteDialog, RecoverFilesDialog, RoutingRatioDialog, WeightDialog } from "./dialogs";
 import { displayLabel } from "./labels";
 import { antigravityLogoSvg } from "./logo";
 import { errorMessage, messages } from "./messages";
@@ -45,7 +46,8 @@ type Dialog =
   | { kind: "recoverFiles"; account: AccountSummary }
   | { kind: "manageAgents"; account: AccountSummary }
   | { kind: "orchestratorOverride"; account: AccountSummary }
-  | { kind: "setWeight"; account: AccountSummary };
+  | { kind: "setWeight"; account: AccountSummary }
+  | { kind: "editRatios" };
 
 function SectionTitle({ colors, title, count }: { colors: Colors; title: string; count?: number }) {
   return (
@@ -182,6 +184,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const setDefault = useRpc(setDefaultAccountRpc);
   const setFallback = useRpc(setFallbackRpc);
   const setRouting = useRpc(setRoutingRpc);
+  const setRoutingWeights = useRpc(setRoutingWeightsRpc);
   const signOut = useRpc(signOutAccountRpc);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
@@ -284,6 +287,8 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
         return openDialog({ kind: "orchestratorOverride", account }, wasModalMenuOpen);
       case "setWeight":
         return openDialog({ kind: "setWeight", account }, wasModalMenuOpen);
+      case "editRatios":
+        return openDialog({ kind: "editRatios" }, wasModalMenuOpen);
     }
   }
 
@@ -311,6 +316,27 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
         : undefined,
     [navigation, host.id],
   );
+  const ratioSummary = useMemo(() => {
+    if (!data || data.accounts.length === 0) return undefined;
+    const hasCustom = data.accounts.some((account) => account.weight !== null);
+    const eligible = data.accounts.filter((account) => account.usable && account.status !== "signed-out");
+    const pool = eligible.length > 0 ? eligible : data.accounts.filter((account) => account.usable);
+    const total = pool.reduce((sum, account) => sum + account.effectiveWeight, 0);
+    if (total <= 0) return t("settings.routingRatiosNone");
+    const parts = pool
+      .filter((account) => account.effectiveWeight > 0)
+      .map((account) => {
+        const share =
+          data.routing.mode === "ratio" && account.routingShare !== null
+            ? account.routingShare
+            : account.effectiveWeight / total;
+        return `${displayLabel(account.label, t, account.kind)} ${Math.round(share * 100)}%`;
+      });
+    const joined = parts.join(" · ");
+    return hasCustom
+      ? t("settings.routingRatiosCustomSummary", { summary: joined })
+      : t("settings.routingRatiosAutoSummary", { summary: joined });
+  }, [data, t]);
   // An odd number of cards leaves room for the add tile beside the last one.
   const showAddTile = data !== undefined && (profiles.length === 0 || (columns === 2 && data.accounts.length % 2 === 1));
 
@@ -440,6 +466,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   options={[
                     { value: "default", label: t("settings.routingModeDefault") },
                     { value: "balanced", label: t("settings.routingModeBalanced") },
+                    { value: "ratio", label: t("settings.routingModeRatio") },
                     { value: "capacity", label: t("settings.routingModeCapacity") },
                   ]}
                   onValueChange={(value) => {
@@ -448,6 +475,16 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
                 />
+                <SettingsRow label={t("settings.routingRatios")} hint={ratioSummary}>
+                  <Button
+                    colors={colors}
+                    size="sm"
+                    variant="secondary"
+                    icon="SlidersHorizontal"
+                    label={t("settings.routingRatiosConfigure")}
+                    onPress={() => openDialog({ kind: "editRatios" })}
+                  />
+                </SettingsRow>
                 <SettingsSelect
                   label={t("settings.routingReserve")}
                   disabled={data.routing.mode === "default"}
@@ -555,7 +592,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   colors={colors}
                   tone="neutral"
                   icon="Gauge"
-                  title={t("settings.routingStickyNote")}
+                  title={data.routing.mode === "ratio" ? t("settings.routingRatioNote") : t("settings.routingStickyNote")}
                 />
               ) : null}
               {defaultUnavailable && fallback ? (
@@ -672,6 +709,19 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
               t("dialog.weightSaved", { label: displayLabel(dialog.account.label, t, dialog.account.kind) }),
               { variant: "success" },
             );
+          }}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {dialog?.kind === "editRatios" && data ? (
+        <RoutingRatioDialog
+          colors={colors}
+          accounts={data.accounts}
+          routingMode={data.routing.mode}
+          onSave={async (entries, mode) => {
+            const state = await setRoutingWeights({ entries, mode });
+            accept(state);
+            toast.show(t("dialog.ratioSaved"), { variant: "success" });
           }}
           onClose={() => setDialog(null)}
         />

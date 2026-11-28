@@ -9,12 +9,13 @@ import {
   recoverSavedFilesRpc,
   savedFilesRpc,
   type AccountSummary,
+  type RoutingMode,
   type SavedFiles,
 } from "../shared/contracts";
 import type { ObservedAgent } from "./agents";
 import { displayLabel, shortPlan } from "./labels";
 import { errorMessage, messages } from "./messages";
-import { font, mono, radius, space, tint, type Colors } from "./theme";
+import { font, mono, radius, space, tabular, tint, type Colors } from "./theme";
 import { Badge, Button, Callout, Divider, Muted } from "./ui";
 
 export function NameDialog({
@@ -693,6 +694,412 @@ export function WeightDialog({
             label={t("dialog.save")}
             loading={busy}
             disabled={!useAuto && !customValid}
+            onPress={() => void save()}
+          />
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
+}
+
+const RATIO_PALETTE = [
+  "#3b82f6",
+  "#10b981",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ec4899",
+  "#06b6d4",
+  "#f97316",
+  "#6366f1",
+] as const;
+
+function ratioSegmentColor(index: number, colors: Colors): string {
+  return index === 0 ? colors.accent : RATIO_PALETTE[index % RATIO_PALETTE.length]!;
+}
+
+/** Modal to configure custom load-balancing ratios across all accounts at once. */
+export function RoutingRatioDialog({
+  colors,
+  accounts,
+  routingMode,
+  onSave,
+  onClose,
+}: {
+  colors: Colors;
+  accounts: readonly AccountSummary[];
+  routingMode: RoutingMode;
+  onSave(entries: { accountId: string; weight: number | null }[], mode: RoutingMode): Promise<void>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation(messages);
+  const [selectedMode, setSelectedMode] = useState<"ratio" | "balanced">(
+    routingMode === "balanced" ? "balanced" : "ratio",
+  );
+  const [autoIds, setAutoIds] = useState<ReadonlySet<string>>(
+    () => new Set(accounts.filter((account) => account.weight === null).map((account) => account.id)),
+  );
+  const [inputs, setInputs] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    for (const account of accounts) {
+      const value = account.weight ?? inferPlanWeight(account.plan);
+      initial[account.id] = formatWeightNumber(value);
+    }
+    return initial;
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const parsedRows = useMemo(() => {
+    return accounts.map((account, index) => {
+      const isAuto = autoIds.has(account.id);
+      const inferred = inferPlanWeight(account.plan);
+      const raw = (inputs[account.id] ?? "").trim();
+      const num = isAuto ? inferred : Number(raw);
+      const valid = isAuto || (raw.length > 0 && Number.isFinite(num) && num >= 0 && num <= 100);
+      const effective = valid ? (isAuto ? inferred : num) : 0;
+      const eligible = account.usable && account.status !== "signed-out";
+      return {
+        account,
+        index,
+        color: ratioSegmentColor(index, colors),
+        isAuto,
+        inferred,
+        valid,
+        effective,
+        eligible,
+      };
+    });
+  }, [accounts, autoIds, inputs, colors]);
+
+  const allValid = parsedRows.every((row) => row.valid);
+  const activeTotal = parsedRows.reduce((sum, row) => sum + (row.eligible ? row.effective : 0), 0);
+  const allTotal = parsedRows.reduce((sum, row) => sum + row.effective, 0);
+  const shareDenominator = activeTotal > 0 ? activeTotal : allTotal;
+  const eligibleAccounts = useMemo(
+    () => accounts.filter((account) => account.usable && account.status !== "signed-out"),
+    [accounts],
+  );
+  const usableIds = useMemo(
+    () => (eligibleAccounts.length > 0 ? eligibleAccounts : accounts.filter((a) => a.usable)).map((a) => a.id),
+    [eligibleAccounts, accounts],
+  );
+
+  function applyAutoPreset() {
+    const nextAuto = new Set<string>();
+    const nextInputs: Record<string, string> = {};
+    for (const account of accounts) {
+      nextAuto.add(account.id);
+      nextInputs[account.id] = formatWeightNumber(inferPlanWeight(account.plan));
+    }
+    setAutoIds(nextAuto);
+    setInputs(nextInputs);
+    setError("");
+  }
+
+  function applyEqualPreset() {
+    const targetSet = new Set(usableIds);
+    const shareValue = targetSet.size === 2 ? 50 : targetSet.size === 4 ? 25 : 1;
+    const nextInputs: Record<string, string> = {};
+    for (const account of accounts) {
+      nextInputs[account.id] = targetSet.has(account.id) ? String(shareValue) : "0";
+    }
+    setAutoIds(new Set());
+    setInputs(nextInputs);
+    setError("");
+  }
+
+  function applySplitPreset(primaryPct: number) {
+    if (usableIds.length < 2) return;
+    const primaryId = usableIds[0]!;
+    const restIds = usableIds.slice(1);
+    const restEach = Number(((100 - primaryPct) / restIds.length).toFixed(2));
+    const restSet = new Set(restIds);
+    const nextInputs: Record<string, string> = {};
+    for (const account of accounts) {
+      if (account.id === primaryId) nextInputs[account.id] = String(primaryPct);
+      else if (restSet.has(account.id)) nextInputs[account.id] = formatWeightNumber(restEach);
+      else nextInputs[account.id] = "0";
+    }
+    setAutoIds(new Set());
+    setInputs(nextInputs);
+    setSelectedMode("ratio");
+    setError("");
+  }
+
+  async function save() {
+    if (busy) return;
+    if (!allValid) {
+      setError(t("dialog.ratioInvalid"));
+      return;
+    }
+    if (shareDenominator <= 0) {
+      setError(t("dialog.ratioZeroWarning"));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const entries = parsedRows.map((row) => ({
+        accountId: row.account.id,
+        weight: row.isAuto ? null : Number(row.effective.toFixed(2)),
+      }));
+      await onSave(entries, selectedMode);
+      onClose();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setBusy(false);
+    }
+  }
+
+  const splitPresets = usableIds.length >= 2 ? [90, 80, 70] : [];
+
+  return (
+    <Modal open title={t("dialog.ratioTitle")} onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
+      <Modal.Content>
+        <Muted colors={colors}>{t("dialog.ratioBody")}</Muted>
+
+        {/* Stacked live proportion bar */}
+        <View style={{ gap: space.xs + 2 }}>
+          <View
+            style={{
+              height: 10,
+              borderRadius: radius.pill,
+              overflow: "hidden",
+              flexDirection: "row",
+              backgroundColor: tint(colors.foregroundMuted, 0.16),
+              gap: 2,
+            }}
+          >
+            {parsedRows.map((row) => {
+              const weightForBar = activeTotal > 0 ? (row.eligible ? row.effective : 0) : row.effective;
+              if (weightForBar <= 0 || shareDenominator <= 0) return null;
+              return (
+                <View
+                  key={row.account.id}
+                  style={{
+                    flex: weightForBar,
+                    backgroundColor: row.color,
+                  }}
+                />
+              );
+            })}
+          </View>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
+            {parsedRows.map((row) => {
+              const label = displayLabel(row.account.label, t, row.account.kind);
+              const weightForBar = activeTotal > 0 ? (row.eligible ? row.effective : 0) : row.effective;
+              const pct = shareDenominator > 0 ? Math.round((weightForBar / shareDenominator) * 100) : 0;
+              return (
+                <View key={row.account.id} style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+                  <View
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: 4,
+                      backgroundColor: weightForBar > 0 ? row.color : tint(colors.foregroundMuted, 0.35),
+                    }}
+                  />
+                  <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                    {label} {weightForBar > 0 ? `${pct}%` : t("dialog.ratioExcluded")}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+
+        {/* Quick presets */}
+        <View style={{ gap: space.xs + 2 }}>
+          <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>{t("dialog.ratioPresets")}</Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs + 2 }}>
+            <Button
+              colors={colors}
+              size="sm"
+              variant={autoIds.size === accounts.length ? "primary" : "secondary"}
+              label={t("dialog.ratioPresetAuto")}
+              disabled={busy}
+              onPress={applyAutoPreset}
+            />
+            {usableIds.length >= 2 ? (
+              <Button
+                colors={colors}
+                size="sm"
+                variant="secondary"
+                label={t("dialog.ratioPresetEqual")}
+                disabled={busy}
+                onPress={applyEqualPreset}
+              />
+            ) : null}
+            {splitPresets.map((primaryPct) => (
+              <Button
+                key={primaryPct}
+                colors={colors}
+                size="sm"
+                variant="secondary"
+                label={`${primaryPct} : ${100 - primaryPct}`}
+                disabled={busy}
+                onPress={() => applySplitPreset(primaryPct)}
+              />
+            ))}
+          </View>
+        </View>
+
+        <Divider colors={colors} />
+
+        {/* Per-account ratio rows */}
+        <View style={{ gap: space.sm }}>
+          {parsedRows.map((row) => {
+            const label = displayLabel(row.account.label, t, row.account.kind);
+            const planTag = shortPlan(row.account.plan, label);
+            const weightForBar = activeTotal > 0 ? (row.eligible ? row.effective : 0) : row.effective;
+            const pct = shareDenominator > 0 && weightForBar > 0 ? Math.round((weightForBar / shareDenominator) * 100) : 0;
+            const isExcluded = !row.isAuto && row.valid && row.effective === 0;
+            return (
+              <View
+                key={row.account.id}
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: space.sm,
+                  paddingVertical: space.xs,
+                }}
+              >
+                <View
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: 5,
+                    backgroundColor: weightForBar > 0 ? row.color : tint(colors.foregroundMuted, 0.3),
+                  }}
+                />
+                <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+                    <Text numberOfLines={1} style={{ ...font.body, fontWeight: "500", color: colors.foreground, flexShrink: 1 }}>
+                      {label}
+                    </Text>
+                    {planTag ? <Badge colors={colors} label={planTag} /> : null}
+                    <Badge
+                      colors={colors}
+                      label={row.isAuto ? t("dialog.ratioAutoTag") : t("dialog.ratioCustomTag")}
+                      tone={row.isAuto ? "neutral" : "accent"}
+                    />
+                  </View>
+                  {!row.eligible ? (
+                    <Text style={{ ...font.caption, color: colors.statusWarning }}>
+                      {row.account.usable ? t(`status.${row.account.status}`) : t("callout.unusableTitle")}
+                    </Text>
+                  ) : null}
+                </View>
+                <TextInput
+                  accessibilityLabel={label}
+                  keyboardType="decimal-pad"
+                  value={inputs[row.account.id] ?? ""}
+                  editable={!busy}
+                  onChangeText={(text) => {
+                    setAutoIds((prev) => {
+                      const next = new Set(prev);
+                      next.delete(row.account.id);
+                      return next;
+                    });
+                    setInputs((prev) => ({ ...prev, [row.account.id]: text }));
+                    setError("");
+                  }}
+                  placeholder={formatWeightNumber(row.inferred)}
+                  placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+                  style={{
+                    ...font.body,
+                    ...tabular,
+                    width: 72,
+                    textAlign: "right",
+                    color: row.valid ? colors.foreground : colors.statusDanger,
+                    backgroundColor: colors.surface0,
+                    borderColor: row.valid ? colors.border : colors.statusDanger,
+                    borderWidth: 1,
+                    borderRadius: radius.md,
+                    paddingHorizontal: space.sm,
+                    paddingVertical: space.xs + 2,
+                    opacity: row.isAuto ? 0.72 : 1,
+                  }}
+                />
+                <Text
+                  style={{
+                    ...font.small,
+                    ...tabular,
+                    width: 44,
+                    textAlign: "right",
+                    color: weightForBar > 0 ? colors.foreground : colors.foregroundMuted,
+                    fontWeight: weightForBar > 0 ? "600" : "400",
+                  }}
+                >
+                  {weightForBar > 0 ? `${pct}%` : "0%"}
+                </Text>
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant={isExcluded ? "secondary" : "ghost"}
+                  label={isExcluded ? t("dialog.ratioAutoTag") : "0"}
+                  disabled={busy}
+                  onPress={() => {
+                    if (isExcluded) {
+                      setAutoIds((prev) => new Set(prev).add(row.account.id));
+                      setInputs((prev) => ({ ...prev, [row.account.id]: formatWeightNumber(row.inferred) }));
+                    } else {
+                      setAutoIds((prev) => {
+                        const next = new Set(prev);
+                        next.delete(row.account.id);
+                        return next;
+                      });
+                      setInputs((prev) => ({ ...prev, [row.account.id]: "0" }));
+                    }
+                    setError("");
+                  }}
+                />
+              </View>
+            );
+          })}
+        </View>
+
+        <Divider colors={colors} />
+
+        {/* Mode toggle: Strict ratio vs Dynamic weighted */}
+        <View style={{ gap: space.xs + 2 }}>
+          <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>{t("dialog.ratioModeLabel")}</Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs + 2 }}>
+            <Button
+              colors={colors}
+              size="sm"
+              variant={selectedMode === "ratio" ? "primary" : "secondary"}
+              label={t("dialog.ratioModeStrict")}
+              disabled={busy}
+              onPress={() => setSelectedMode("ratio")}
+            />
+            <Button
+              colors={colors}
+              size="sm"
+              variant={selectedMode === "balanced" ? "primary" : "secondary"}
+              label={t("dialog.ratioModeBalanced")}
+              disabled={busy}
+              onPress={() => setSelectedMode("balanced")}
+            />
+          </View>
+          <Text style={{ ...font.caption, color: colors.foregroundMuted }}>
+            {selectedMode === "ratio" ? t("dialog.ratioModeStrictHint") : t("dialog.ratioModeBalancedHint")}
+          </Text>
+        </View>
+
+        {shareDenominator <= 0 && allValid ? (
+          <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("dialog.ratioZeroWarning")} />
+        ) : null}
+        {error ? <Callout colors={colors} tone="danger" icon="CircleAlert" title={error} /> : null}
+
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: space.sm }}>
+          <Button colors={colors} variant="ghost" label={t("dialog.cancel")} disabled={busy} onPress={onClose} />
+          <Button
+            colors={colors}
+            variant="primary"
+            label={t("dialog.save")}
+            loading={busy}
+            disabled={!allValid || shareDenominator <= 0}
             onPress={() => void save()}
           />
         </View>

@@ -234,11 +234,16 @@ export function computeRoutingShares(
     if (cooling) continue;
     if (exhausted(account.quota, pool, now)) continue;
     const metrics = evaluatePoolQuota(account.quota, pool, now);
-    const effectiveWeight = computeEffectiveWeight({
-      baseWeight: account.effectiveWeight,
-      metrics,
-      runningCount: runningCounts?.get(account.id) ?? 0,
-    });
+    const effectiveWeight =
+      mode === "ratio"
+        ? metrics.blendedRemaining <= 0.001
+          ? 0
+          : account.effectiveWeight
+        : computeEffectiveWeight({
+            baseWeight: account.effectiveWeight,
+            metrics,
+            runningCount: runningCounts?.get(account.id) ?? 0,
+          });
     if (effectiveWeight <= 0) continue;
     candidates.push({
       id: account.id,
@@ -371,12 +376,17 @@ export class AccountRouter {
       }
 
       const metrics = evaluatePoolQuota(quota, pool, now);
-      const effectiveWeight = computeEffectiveWeight({
-        baseWeight: account.effectiveWeight,
-        metrics,
-        runningCount: this.runningCountOf(id),
-        recentDispatches: decayedDispatchCount(this.dispatches.get(id), now),
-      });
+      const effectiveWeight =
+        effectiveMode === "ratio"
+          ? metrics.blendedRemaining <= 0.001
+            ? 0
+            : account.effectiveWeight
+          : computeEffectiveWeight({
+              baseWeight: account.effectiveWeight,
+              metrics,
+              runningCount: this.runningCountOf(id),
+              recentDispatches: decayedDispatchCount(this.dispatches.get(id), now),
+            });
       if (effectiveWeight <= 0) continue;
 
       candidates.push({

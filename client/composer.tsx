@@ -55,7 +55,7 @@ function DraftAccount({ composer }: { composer: PluginComposer }) {
     ? {
         value: AUTO_ACCOUNT_ID,
         label: t("composerAuto"),
-        description: t("composerAutoDesc"),
+        description: data.routing.mode === "ratio" ? t("composerAutoRatioDesc") : t("composerAutoDesc"),
       }
     : {
         value: AUTO_ACCOUNT_ID,

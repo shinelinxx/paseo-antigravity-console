@@ -25,6 +25,7 @@ import {
   setOrchestratorRpc,
   setPricingRpc,
   setRoutingRpc,
+  setRoutingWeightsRpc,
   signOutAccountRpc,
   startSignInRpc,
   subagentArtifactRpc,
@@ -205,6 +206,13 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setRoutingRpc, async (patch) => {
     await ready;
     await service.setRouting(patch);
+    router.reset();
+    return accountState();
+  });
+
+  server.handle(setRoutingWeightsRpc, async ({ entries, mode }) => {
+    await ready;
+    await service.setRoutingWeights(entries, mode);
     router.reset();
     return accountState();
   });
