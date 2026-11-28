@@ -82,23 +82,52 @@ async function configuredAgyCommand(): Promise<string | null> {
   return null;
 }
 
+const IS_WINDOWS = process.platform === "win32";
+
+function winExecutableExtensions(): string[] {
+  const raw = process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM";
+  const exts = raw
+    .split(";")
+    .map((ext) => ext.trim().toLowerCase())
+    .filter((ext) => ext.startsWith("."));
+  return exts.length ? exts : [".exe", ".cmd", ".bat", ".com"];
+}
+
+function expandExecutableCandidates(base: string): string[] {
+  if (!IS_WINDOWS) return [base];
+  const ext = path.extname(base).toLowerCase();
+  const exts = winExecutableExtensions();
+  if (ext && exts.includes(ext)) return [base];
+  return [...exts.map((suffix) => `${base}${suffix}`), base];
+}
+
 /** Finds the agy executable the same way a user would expect: config override, PATH, usual installs. */
 export async function resolveAgy(): Promise<string | null> {
   const candidates: string[] = [];
   const configured = await configuredAgyCommand();
+  const configuredHasSep = Boolean(configured && (configured.includes("/") || (IS_WINDOWS && configured.includes("\\"))));
   if (configured) {
-    if (path.isAbsolute(configured)) candidates.push(configured);
-    else if (configured.includes("/")) candidates.push(path.resolve(REAL_HOME, configured));
+    if (path.isAbsolute(configured)) candidates.push(...expandExecutableCandidates(configured));
+    else if (configuredHasSep) candidates.push(...expandExecutableCandidates(path.resolve(REAL_HOME, configured)));
   }
-  const name = configured && !configured.includes("/") ? configured : "agy";
+  const name = configured && !configuredHasSep ? configured : "agy";
   for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, name));
+    if (dir) candidates.push(...expandExecutableCandidates(path.join(dir, name)));
   }
-  candidates.push(
-    path.join(REAL_HOME, ".local", "bin", "agy"),
-    "/opt/homebrew/bin/agy",
-    "/usr/local/bin/agy",
-  );
+  if (IS_WINDOWS) {
+    const localAppData = process.env.LOCALAPPDATA?.trim() || path.join(REAL_HOME, "AppData", "Local");
+    candidates.push(
+      path.join(localAppData, "agy", "bin", "agy.exe"),
+      path.join(REAL_HOME, ".local", "bin", "agy.exe"),
+      path.join(REAL_HOME, ".local", "bin", "agy.cmd"),
+    );
+  } else {
+    candidates.push(
+      path.join(REAL_HOME, ".local", "bin", "agy"),
+      "/opt/homebrew/bin/agy",
+      "/usr/local/bin/agy",
+    );
+  }
   for (const candidate of candidates) {
     if (await isExecutable(candidate)) return candidate;
   }
