@@ -9,16 +9,21 @@ import { REAL_CLI_DIR, profileCliDir, profileHome } from "./paths";
 /** Older agy builds select file-backed sign-in in an SSH session. */
 export const FAKE_SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 0";
 
+const IS_WINDOWS = process.platform === "win32";
+
 /**
  * Profile accounts use their own data directory and explicitly select file-backed sign-in.
  * SSH_CONNECTION also supports older agy builds that select file storage in SSH sessions.
+ * On Windows, agy uses USERPROFILE rather than HOME to locate `.gemini/antigravity-cli`.
  * ANTIGRAVITY_HOME is ignored by agy, but Paseo's built-in usage source reads it to show the quota
  * of the account the agent runs on.
  */
 export function sessionEnv(accountId: string, current: Readonly<Record<string, string>>): Record<string, string> {
   if (accountId === SYSTEM_ACCOUNT_ID) return {};
+  const home = profileHome(accountId);
   return {
-    HOME: profileHome(accountId),
+    HOME: home,
+    ...(IS_WINDOWS ? { USERPROFILE: home } : {}),
     SSH_CONNECTION: current.SSH_CONNECTION || FAKE_SSH_CONNECTION,
     AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "1",
     ANTIGRAVITY_HOME: profileCliDir(accountId),
@@ -32,7 +37,7 @@ export function commandEnv(accountId: string): NodeJS.ProcessEnv {
   for (const [key, value] of Object.entries(env)) if (value !== undefined) base[key] = value;
   Object.assign(env, sessionEnv(accountId, base));
   // Never let a probe or sign-in open a browser on the daemon host or update the CLI.
-  env.BROWSER = "/usr/bin/false";
+  env.BROWSER = IS_WINDOWS ? "cmd /c exit 1" : "/usr/bin/false";
   env.AGY_CLI_DISABLE_AUTO_UPDATE = "1";
   return env;
 }

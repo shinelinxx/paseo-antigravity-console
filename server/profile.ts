@@ -67,20 +67,43 @@ async function readDirSafe(dir: string): Promise<Dirent[]> {
   }
 }
 
-/** Ensures `link` is a symlink to `target`. Leaves real files and directories alone. */
-async function ensureLink(link: string, target: string): Promise<void> {
+const IS_WINDOWS = process.platform === "win32";
+const WINDOWS_SKIP_HOME_ENTRY = /^(ntuser\.dat.*|ntuser\.ini|desktop\.ini)$/i;
+
+function samePath(a: string, b: string): boolean {
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return IS_WINDOWS ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+/** Ensures `link` is a symlink (or directory junction on Windows) to `target`. Leaves real files and directories alone. */
+async function ensureLink(link: string, target: string, isDir?: boolean): Promise<void> {
   try {
     const stat = await fs.lstat(link);
     if (!stat.isSymbolicLink()) return;
-    if ((await fs.readlink(link)) === target) return;
+    if (samePath(await fs.readlink(link), target)) return;
     await fs.unlink(link);
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
   }
+  let targetIsDir = isDir;
   try {
-    await fs.symlink(target, link);
+    if (IS_WINDOWS) {
+      if (targetIsDir === undefined) {
+        const targetStat = await fs.stat(target).catch(() => null);
+        targetIsDir = targetStat?.isDirectory() ?? false;
+      }
+      await fs.symlink(target, link, targetIsDir ? "junction" : "file");
+    } else {
+      await fs.symlink(target, link);
+    }
   } catch (error) {
-    if (errorCode(error) !== "EEXIST") throw error;
+    const code = errorCode(error);
+    if (code === "EEXIST") return;
+    // Without Windows Developer Mode or elevation, file symlinks fail with EPERM/EACCES.
+    // Directory junctions work without elevated privileges, so skip non-critical file links on Windows.
+    if (IS_WINDOWS && !targetIsDir && (code === "EPERM" || code === "EACCES")) return;
+    throw error;
   }
 }
 
@@ -103,7 +126,7 @@ async function pruneLinks(dir: string, sourceDir: string, keep: ReadonlySet<stri
     if (!entry.isSymbolicLink() || keep.has(entry.name)) continue;
     const link = path.join(dir, entry.name);
     const target = await fs.readlink(link).catch(() => "");
-    if (path.dirname(target) === sourceDir) await fs.unlink(link).catch(() => undefined);
+    if (target && samePath(path.dirname(target), sourceDir)) await fs.unlink(link).catch(() => undefined);
   }
 }
 
@@ -116,8 +139,9 @@ async function mirror(
   const tasks: Array<Promise<void>> = [];
   for (const entry of await readDirSafe(sourceDir)) {
     if (skip(entry.name)) continue;
+    if (IS_WINDOWS && (entry.isSymbolicLink() || WINDOWS_SKIP_HOME_ENTRY.test(entry.name))) continue;
     keep.add(entry.name);
-    tasks.push(ensureLink(path.join(destinationDir, entry.name), path.join(sourceDir, entry.name)));
+    tasks.push(ensureLink(path.join(destinationDir, entry.name), path.join(sourceDir, entry.name), entry.isDirectory()));
   }
   await Promise.all(tasks);
   await pruneLinks(destinationDir, sourceDir, keep);
@@ -172,7 +196,7 @@ async function syncProfile(accountId: string, orchestratorOverride?: Orchestrato
     SHARED_CLI_DIRS.map(async (name) => {
       const target = path.join(REAL_CLI_DIR, name);
       await fs.mkdir(target, { recursive: true });
-      await ensureLink(path.join(cli, name), target);
+      await ensureLink(path.join(cli, name), target, true);
     }),
   );
   await syncSettings(cli, orchestratorOverride);
@@ -379,7 +403,12 @@ async function moveAcrossVolumes(accountId: string, source: string, target: stri
   if (!stat) return;
   if (stat.isSymbolicLink()) {
     const linkTarget = await fs.readlink(source);
-    await fs.symlink(linkTarget, target);
+    if (IS_WINDOWS) {
+      const targetStat = await fs.stat(source).catch(() => null);
+      await fs.symlink(linkTarget, target, targetStat?.isDirectory() ? "junction" : "file");
+    } else {
+      await fs.symlink(linkTarget, target);
+    }
     if ((await profileEntry(accountId, source))?.isSymbolicLink()) {
       await fs.unlink(source).catch(() => undefined);
     }
@@ -634,9 +663,13 @@ export function deleteSignIn(accountId: string, recorded: readonly string[]): Pr
     const cli = profileCliDir(accountId);
     if (!(await profileEntry(accountId, cli))?.isDirectory()) return [];
     const targets = new Set<string>();
+    const cliPrefix = cli + path.sep;
     for (const relative of recorded) {
       const full = path.resolve(home, relative);
-      if (full.startsWith(cli + path.sep)) targets.add(full);
+      const inCli = IS_WINDOWS
+        ? full.toLowerCase().startsWith(cliPrefix.toLowerCase())
+        : full.startsWith(cliPrefix);
+      if (inCli) targets.add(full);
     }
     if (targets.size === 0) {
       for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 2 })) targets.add(file);
