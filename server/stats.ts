@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   DAILY_HISTORY_DAYS,
-  UNATTRIBUTED_ACCOUNT_ID,
   accountIdSchema,
   type StatsRange,
   type StatsScope,
@@ -43,7 +42,7 @@ interface CallRecord extends Generation {
   at: number;
   conversationId: string;
   isSubagent: boolean;
-  accountId: string | null;
+  accountId: string;
 }
 
 interface FileCache {
@@ -500,6 +499,8 @@ export class UsageStatsReader {
     for (const entry of statEntries) {
       if (!entry) continue;
       const { conversationId, file, birth, signature } = entry;
+      const turns = await this.turnsForConversation(conversationId);
+      if (turns.length === 0) continue;
       seen.add(file);
       let cache = this.files.get(file);
       if (!cache || cache.signature !== signature) {
@@ -510,22 +511,17 @@ export class UsageStatsReader {
       if (!cache) continue;
       const parentId = await this.parentOf(conversationId);
       const isSubagent = parentId !== null;
-      const turns = await this.turnsForConversation(conversationId);
       // Earliest step timestamp for a subagent (when its parent spawned it), used when an async
       // subagent call finishes after its parent's turn ended while still running in the same process.
       const subagentSpawnAt = isSubagent ? cache.subagentSpawnAt : undefined;
-      // Estimate a missing timestamp for overall totals only. Account attribution requires an actual timestamp.
-      let last = cache.fallback;
       for (const generation of cache.generations) {
         const startedAt = generation.responseId ? cache.started.get(generation.responseId) : undefined;
-        const at = startedAt ?? last;
-        last = at;
+        if (startedAt === undefined) continue;
         const accountId =
-          startedAt === undefined
-            ? null
-            : (accountForGeneration(turns, startedAt) ??
-              (isSubagent && subagentSpawnAt !== undefined ? accountForGeneration(turns, subagentSpawnAt) : null));
-        records.push({ ...generation, at, conversationId, isSubagent, accountId });
+          accountForGeneration(turns, startedAt) ??
+          (isSubagent && subagentSpawnAt !== undefined ? accountForGeneration(turns, subagentSpawnAt) : null);
+        if (!accountId) continue;
+        records.push({ ...generation, at: startedAt, conversationId, isSubagent, accountId });
       }
     }
     for (const file of this.files.keys()) {
@@ -600,7 +596,7 @@ export class UsageStatsReader {
 
       // Track per-account totals across the time range (before account/model filters so selectors stay complete).
       if (scope === "all" || (scope === "subagent") === record.isSubagent) {
-        const bucketId = record.accountId ?? UNATTRIBUTED_ACCOUNT_ID;
+        const bucketId = record.accountId;
         let entry = accounts.get(bucketId);
         if (!entry) {
           entry = { totals: emptyTotals(), conversations: new Set() };
@@ -610,11 +606,7 @@ export class UsageStatsReader {
         entry.conversations.add(record.conversationId);
       }
 
-      if (accountId) {
-        const matchesAccount =
-          accountId === UNATTRIBUTED_ACCOUNT_ID ? record.accountId === null : record.accountId === accountId;
-        if (!matchesAccount) continue;
-      }
+      if (accountId && record.accountId !== accountId) continue;
 
       // Track main vs subagent split within the selected range & account.
       add(record.isSubagent ? breakdown.subagent : breakdown.main, record, cost);
@@ -651,15 +643,11 @@ export class UsageStatsReader {
       accounts: [...accounts.entries()]
         .map(([id, value]) => ({
           accountId: id,
-          label: id === UNATTRIBUTED_ACCOUNT_ID ? UNATTRIBUTED_ACCOUNT_ID : labelOf(id),
+          label: labelOf(id),
           conversations: value.conversations.size,
           ...value.totals,
         }))
-        .sort((left, right) => {
-          if (left.accountId === UNATTRIBUTED_ACCOUNT_ID) return 1;
-          if (right.accountId === UNATTRIBUTED_ACCOUNT_ID) return -1;
-          return right.requests - left.requests;
-        }),
+        .sort((left, right) => right.requests - left.requests),
       conversations: conversationSet.size,
       hasCustomPricing: Object.keys(customPricing).length > 0,
       generatedAt: new Date(now).toISOString(),
@@ -686,11 +674,7 @@ export class UsageStatsReader {
 
     for (const record of await this.records()) {
       if (record.at < firstStart || record.at > lastEnd) continue;
-      if (accountId) {
-        const matchesAccount =
-          accountId === UNATTRIBUTED_ACCOUNT_ID ? record.accountId === null : record.accountId === accountId;
-        if (!matchesAccount) continue;
-      }
+      if (accountId && record.accountId !== accountId) continue;
       if (scope === "main" && record.isSubagent) continue;
       if (scope === "subagent" && !record.isSubagent) continue;
       if (model && record.label !== model) continue;

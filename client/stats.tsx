@@ -1003,8 +1003,6 @@ const AccountTable = memo(function AccountTable({
       const b = sortValue(right.figures, sort.key);
       if (a === null || b === null) return a === null ? (b === null ? 0 : 1) : -1;
       if (b !== a) return sort.descending ? b - a : a - b;
-      if (left.account.accountId === UNATTRIBUTED_ACCOUNT_ID) return 1;
-      if (right.account.accountId === UNATTRIBUTED_ACCOUNT_ID) return -1;
       return left.account.label.localeCompare(right.account.label);
     });
     return list;
@@ -1347,14 +1345,11 @@ export const UsageSection = memo(function UsageSection({
       });
     }
     for (const entry of stats?.accounts ?? []) {
-      if (seen.has(entry.accountId)) continue;
+      if (entry.accountId === UNATTRIBUTED_ACCOUNT_ID || seen.has(entry.accountId)) continue;
       seen.add(entry.accountId);
       rows.push({
         ...entry,
-        label:
-          entry.accountId === UNATTRIBUTED_ACCOUNT_ID
-            ? t("stats.accountUnattributed")
-            : displayLabel(entry.label, t, accountKindById.get(entry.accountId)),
+        label: displayLabel(entry.label, t, accountKindById.get(entry.accountId)),
       });
     }
     return rows;
@@ -1466,12 +1461,10 @@ export const UsageSection = memo(function UsageSection({
               }}
             >
               <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
-                {accountId === UNATTRIBUTED_ACCOUNT_ID
-                  ? t("stats.accountUnattributed")
-                  : (() => {
-                      const matched = accounts.find((entry) => entry.id === accountId);
-                      return matched ? displayLabel(matched.label, t, matched.kind) : accountId;
-                    })()}
+                {(() => {
+                  const matched = accounts.find((entry) => entry.id === accountId);
+                  return matched ? displayLabel(matched.label, t, matched.kind) : accountId;
+                })()}
               </Text>
               <Icon name="X" size={12} color={colors.accent} />
             </Pressable>

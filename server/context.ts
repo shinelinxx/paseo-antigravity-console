@@ -191,7 +191,8 @@ export class ContextReader {
 
   private info(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
     const cached = this.agents.get(agentId);
-    if (cached && Date.now() - cached.fetchedAt < 20_000) {
+    const ttlMs = cached && (!cached.antigravity || cached.conversationId !== null) ? 5 * 60_000 : 30_000;
+    if (cached && Date.now() - cached.fetchedAt < ttlMs) {
       this.rememberAgent(agentId, cached);
       return Promise.resolve(cached);
     }

@@ -116,7 +116,7 @@ export function createUsageSource(service: AccountService): UsageSourceRegistrat
       if (account?.unsafeDetail) {
         return { status: "error", error: account.unsafeDetail };
       }
-      const status = await service.quotaFor(accountId, 60_000);
+      const status = await service.quotaFor(accountId, 5 * 60_000);
       if (status.status === "signed-in" && status.quota) {
         const windows = quotaWindows(status.quota);
         if (windows.length === 0) {

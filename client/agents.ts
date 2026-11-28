@@ -64,8 +64,10 @@ type Counts = ReadonlyMap<string, number>;
 type WorkspaceSubagents = ReadonlyMap<string, number>;
 type Timer = ReturnType<typeof setTimeout>;
 
-const CONTEXT_POLL_MS = 5000;
-const IDLE_POLL_MS = 30_000;
+const CONTEXT_POLL_MS = 10_000;
+const IDLE_POLL_MS = 5 * 60_000;
+const STARTUP_POLL_DELAY_MS = 2500;
+const LIVE_POLL_DELAY_MS = 800;
 const POLL_BATCH_SIZE = 100;
 
 export interface PoolQuotaSummary {
@@ -529,16 +531,31 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
   }
 
+  let orchestratorLoading = false;
+  function hasOrchestratorAgent(): boolean {
+    for (const agent of agents.values()) {
+      if (agent.workspace && isOrchestratorModel(agent.model)) return true;
+    }
+    return false;
+  }
+
   async function readOrchestrator(refresh = false) {
+    if (orchestratorLoading && !refresh) return;
+    orchestratorLoading = true;
     try {
       orchestrator = await client.rpc(getOrchestratorRpc, { refresh });
       agents.forEach(renderOrchestratorPill);
     } catch (error) {
       if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] orchestrator settings unavailable", error);
+    } finally {
+      orchestratorLoading = false;
     }
   }
-  void readOrchestrator();
-  const orchestratorTimer = setInterval(() => void readOrchestrator(), 10 * 60_000);
+  const orchestratorTimer = setInterval(() => {
+    if (orchestrator !== null || hasOrchestratorAgent()) {
+      void readOrchestrator();
+    }
+  }, 10 * 60_000);
 
   let polling = false;
   async function pollContext(forceAll = false) {
@@ -623,9 +640,13 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   }
 
   let soon: Timer | undefined;
-  function pollSoon(forceAll = false) {
+  let initialSnapshotPolled = false;
+  function pollSoon(forceAll = false, delayMs = LIVE_POLL_DELAY_MS) {
     clearTimeout(soon);
-    soon = setTimeout(() => void pollContext(forceAll), 800);
+    soon = setTimeout(() => {
+      initialSnapshotPolled = true;
+      void pollContext(forceAll);
+    }, delayMs);
   }
   const contextTimer = setInterval(() => void pollContext(), CONTEXT_POLL_MS);
 
@@ -665,7 +686,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     const nextSignature = next.accounts
       .map((a) => `${a.id}:${a.status}:${a.email ?? ""}:${JSON.stringify(a.orchestratorOverride)}`)
       .join("|");
-    if (accountSignature && nextSignature !== accountSignature) {
+    if (accountSignature && nextSignature !== accountSignature && (orchestrator !== null || hasOrchestratorAgent())) {
       void readOrchestrator(true);
     }
     accountSignature = nextSignature;
@@ -750,7 +771,8 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     // A status change usually means a turn started or ended: context changes then.
     if (!old || old.running !== member.running) {
       lastPolledAt.delete(row.id);
-      pollSoon();
+      const delay = initialSnapshotPolled ? LIVE_POLL_DELAY_MS : STARTUP_POLL_DELAY_MS;
+      pollSoon(false, delay);
     }
     if (
       old &&
@@ -767,7 +789,11 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     renderAccountPill(member);
     renderContextPill(member);
     renderSubagentPill(member);
-    renderOrchestratorPill(member);
+    if (member.workspace && isOrchestratorModel(member.model) && !orchestrator && !orchestratorLoading) {
+      void readOrchestrator();
+    } else {
+      renderOrchestratorPill(member);
+    }
     return true;
   }
 
